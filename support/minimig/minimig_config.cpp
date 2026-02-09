@@ -15,6 +15,7 @@
 #include "../../ide.h"
 #include "minimig_boot.h"
 #include "minimig_fdd.h"
+#include "minimig_hdd.h"
 #include "minimig_config.h"
 #include "minimig_share.h"
 #include "akiko_cd32.h"
@@ -35,7 +36,7 @@ typedef struct
 	mm_filterTYPE   filter;
 	unsigned char   memory;
 	unsigned char   chipset;
-	mm_floppyTYPE   floppy;
+	mm_floppyTYPEOld   floppy;
 	unsigned char   disable_ar3;
 	unsigned char   enable_ide;
 	unsigned char   scanlines;
@@ -44,6 +45,27 @@ typedef struct
 	unsigned char   cpu;
 	unsigned char   autofire;
 } configTYPE_old;
+
+typedef struct
+{
+	char            id[8];
+	unsigned short  version;
+	unsigned short  ext_cfg2;
+	char            kickstart[992];
+	char            label[32];
+	unsigned short  ext_cfg;
+	unsigned char   memory;
+	unsigned char   chipset;
+	mm_floppyTYPEOld   floppy;
+	unsigned char   disable_ar3;
+	unsigned char   ide_cfg;
+	unsigned char   scanlines;
+	unsigned char   audio;
+	mm_hardfileTYPE hardfile[4];
+	unsigned char   cpu;
+	unsigned char   autofire;
+	char            info[64];
+} mm_configTYPE_NoExtFloppy;
 
 mm_configTYPE minimig_config = { };
 static unsigned char romkey[3072];
@@ -399,7 +421,9 @@ const char* minimig_get_cfg_info(int num, int label)
 
 inline int hdd_open(int unit)
 {
-	return ide_open(unit, minimig_config.hardfile[unit].filename);
+	return (ide_check() & 0x8000) ?
+		ide_open(unit, minimig_config.hardfile[unit].filename) :
+		OpenHardfile(unit, minimig_config.hardfile[unit].filename);
 }
 
 static int force_reload_kickstart = 0;
@@ -414,6 +438,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	{
 		minimig_ConfigChipset(minimig_config.chipset);
 		minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+		minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
 	}
 
 	printf("CPU clock     : %s\n", minimig_config.chipset & 0x01 ? "turbo" : "normal");
@@ -425,6 +450,18 @@ static void ApplyConfiguration(char reloadkickstart)
 
 	printf("Floppy drives : %u\n", minimig_config.floppy.drives + 1);
 	printf("Floppy speed  : %s\n", minimig_config.floppy.speed ? "fast" : "normal");
+	for (int drive = 0; drive <= minimig_config.floppy.drives; drive++) {
+		if (minimig_config.floppy.extDrives[drive]) {
+	        printf("   Drive DF%u : External Drive ", drive);
+			switch (minimig_config.floppy.extDrives[drive]) {
+				case 1: printf("0/A"); break;
+				case 2: printf("1/B"); break;
+				case 3: printf("2"); break;
+				case 4: printf("3"); break;
+			}
+			printf("\n");
+		}
+	}
 
 	printf("\n");
 
@@ -458,6 +495,7 @@ static void ApplyConfiguration(char reloadkickstart)
 
 	minimig_ConfigChipset(minimig_config.chipset);
 	minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+	minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
 
 	if (minimig_config.memory & 0x40) UploadActionReplay();
 
@@ -502,6 +540,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	minimig_ConfigVideo(minimig_config.scanlines);
 	minimig_ConfigAudio(minimig_config.audio);
 	minimig_ConfigAutofire(minimig_config.autofire, 0xC);
+	minimig_ConfigUserPort(minimig_config.userport);
 	minimig_set_extcfg(minimig_get_extcfg() & ~1);
 }
 
@@ -518,7 +557,7 @@ int minimig_cfg_load(int num)
 	{
 		BootPrint("Opened configuration file\n");
 		printf("Configuration file size: %s, %d\n", filename, size);
-		if (size == sizeof(minimig_config) || size == 5152)
+		if (size == sizeof(minimig_config) || size == 5220)
 		{
 			static mm_configTYPE tmpconf = {};
 			if (FileLoadConfig(filename, &tmpconf, sizeof(tmpconf)))
@@ -528,6 +567,50 @@ int minimig_cfg_load(int num)
 					// A few more sanity checks...
 					if (tmpconf.floppy.drives <= 4) {
 						memcpy((void*)&minimig_config, (void*)&tmpconf, sizeof(minimig_config));
+						result = 1; // We successfully loaded the config.
+					}
+					else BootPrint("Config file sanity check failed!\n");
+				}
+				else BootPrint("Wrong configuration file format!\n");
+			}
+			else printf("Cannot load configuration file\n");
+		}
+		else if (size == sizeof(mm_configTYPE_NoExtFloppy) || size == 5216) {
+			printf("Pre ext floppy configuration file.\n");
+			static mm_configTYPE_NoExtFloppy tmpconf;
+			if (FileLoadConfig(filename, &tmpconf, sizeof(tmpconf)))
+			{
+				// check file id and version
+				if (strncmp(tmpconf.id, config_id, sizeof(minimig_config.id)) == 0) {
+					if (tmpconf.floppy.drives<4) {
+						memcpy(minimig_config.id, tmpconf.id, 8);
+						minimig_config.version = tmpconf.version;
+						minimig_config.ext_cfg2 = tmpconf.ext_cfg2;
+						memcpy(minimig_config.kickstart, tmpconf.kickstart, 992);
+						memcpy(minimig_config.label,tmpconf.label,32);
+						minimig_config.ext_cfg = tmpconf.ext_cfg;
+						minimig_config.chipset = tmpconf.chipset;
+						minimig_config.floppy.drives = tmpconf.floppy.drives;
+						minimig_config.floppy.speed = tmpconf.floppy.speed;
+						minimig_config.floppy.extDrives[0] = 0;
+						minimig_config.floppy.extDrives[1] = 0;
+						minimig_config.floppy.extDrives[2] = 0;
+						minimig_config.floppy.extDrives[3] = 0;
+					
+						minimig_config.disable_ar3 = tmpconf.disable_ar3;
+						minimig_config.ide_cfg = tmpconf.ide_cfg;
+						minimig_config.scanlines = tmpconf.scanlines;
+						minimig_config.audio = tmpconf.audio;
+					
+						minimig_config.hardfile[0] = tmpconf.hardfile[0];
+						minimig_config.hardfile[1] = tmpconf.hardfile[1];
+						minimig_config.hardfile[2] = tmpconf.hardfile[2];
+						minimig_config.hardfile[3] = tmpconf.hardfile[3];
+						minimig_config.userport = mm_userportMode::mmup_mp32pi;  // default as before
+
+						minimig_config.cpu = tmpconf.cpu;
+						minimig_config.autofire = tmpconf.autofire;
+						memcpy(minimig_config.info, tmpconf.info, 64);
 						result = 1; // We successfully loaded the config.
 					}
 					else BootPrint("Config file sanity check failed!\n");
@@ -572,6 +655,10 @@ int minimig_cfg_load(int num)
 		minimig_config.memory = 0x11;
 		minimig_config.cpu = 0;
 		minimig_config.chipset = 0;
+		minimig_config.floppy.extDrives[0] = 0;
+		minimig_config.floppy.extDrives[1] = 0;
+		minimig_config.floppy.extDrives[2] = 0;
+		minimig_config.floppy.extDrives[3] = 0;
 		minimig_config.floppy.speed = CONFIG_FLOPPY2X;
 		minimig_config.floppy.drives = 1;
 		minimig_config.ide_cfg = 0;
@@ -583,6 +670,7 @@ int minimig_cfg_load(int num)
 		minimig_config.hardfile[2].filename[0] = 0;
 		minimig_config.hardfile[3].cfg = 0;
 		minimig_config.hardfile[3].filename[0] = 0;
+		minimig_config.userport = mm_userportMode::mmup_mp32pi;  // default as before
 		BootPrintEx(">>> No config found. Using defaults. <<<");
 	}
 
@@ -590,6 +678,7 @@ int minimig_cfg_load(int num)
 	{
 		df[i].status = 0;
 		FileClose(&df[i].file);
+		if (df[i].fluxFile) df[i].fluxFile->closeFile();
 	}
 
 	// print config to boot screen
@@ -837,6 +926,19 @@ void minimig_ConfigChipset(unsigned char chipset)
 void minimig_ConfigFloppy(unsigned char drives, unsigned char speed)
 {
 	spi_uio_cmd8(UIO_MM2_FLP, ((drives & 0x03) << 2) | (speed & 0x03));
+}
+
+void minimig_ConfigFloppyExt(unsigned char drive0, unsigned char drive1, unsigned char drive2, unsigned char drive3)
+{
+	printf("Floppy Ext 01: %x\n", drive0 | (drive1 << 3));
+	printf("Floppy Ext 23: %x\n", drive2 | (drive3 << 3));
+	spi_uio_cmd8(UIO_MM2_FLPEX01, drive0 | (drive1 << 3));
+	spi_uio_cmd8(UIO_MM2_FLPEX23, drive2 | (drive3 << 3));
+}
+
+void minimig_ConfigUserPort(mm_userportMode mode) {
+	printf("User Port: %s\n", mode == mm_userportMode::mmup_mp32pi ? "MT32pi":"MiSTer Floppy");
+	spi_uio_cmd8(UIO_MM2_USRPORT, mode == mm_userportMode::mmup_mp32pi ? 0 : 1);
 }
 
 void minimig_ConfigAutofire(unsigned char autofire, unsigned char mask)
