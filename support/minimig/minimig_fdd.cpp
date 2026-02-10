@@ -216,6 +216,7 @@ void ReadTrack(adfTYPE* drive)
 
 	if (fluxMode) {
 		if (!drive->fluxFile->selectTrack(drive->track)) return;
+		sector = 0;
 	}
 	else {
 		if (drive->track != drive->track_prev)

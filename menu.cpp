@@ -5759,7 +5759,7 @@ void HandleUI(void)
 		/* minimig main menu                                              */
 		/******************************************************************/
 	case MENU_MINIMIG_MAIN1:
-		menumask = 0x1EF0;
+		menumask = 0x1FF0;
 		OsdSetTitle("Minimig", OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
 		helptext_idx = HELPTEXT_MAIN;
 
@@ -5767,6 +5767,7 @@ void HandleUI(void)
 		{
 			if (!menusub) firstmenu = 0;
 			adjvisible = 0;
+			uint16_t osdMask = spi_uio_cmd16(UIO_GET_OSDMASK, 0);
 			// floppy drive info
 			// We display a line for each drive that's active
 			// in the config file, but grey out any that the FPGA doesn't think are active.
@@ -5802,9 +5803,14 @@ void HandleUI(void)
 							s[6 + len + 2] = 0;
 							if (!(df[i].status & DSK_WRITABLE)) s[6 + len + 1] = '\x17'; // padlock icon for write-protected disks
 						}
-						else // no floppy disk
-						{
-							strcat(s, "* no disk *");
+						else {
+							switch (minimig_config.userport == mmup_misterfloppy ? minimig_config.floppy.extDrives[i] : 0) {
+								case 1: strcat(s, "External Drive 0/A"); break;
+								case 2: strcat(s, "External Drive 1/B"); break;
+								case 3: strcat(s, "External Drive 2"); break;
+								case 4: strcat(s, "External Drive 3"); break;
+								default: strcat(s, "* no disk *"); break; // no floppy disk
+							}
 						}
 					}
 					else if (i <= minimig_config.floppy.drives)
@@ -5816,29 +5822,40 @@ void HandleUI(void)
 					MenuWrite(i, s, menusub == (uint32_t)i, (i > drives) || (i > minimig_config.floppy.drives));
 				}
 			}
-
 			m = 4;
 			strcpy(s,      " Joystick Swap:          ");
-			strcat(s, (minimig_config.autofire & 0x8) ? " ON" : "OFF");
-			MenuWrite(m++, s, menusub == 4, 0);
-			MenuWrite(m++),
-
-			MenuWrite(m++, " Drives                    \x16", menusub == 5, 0);
-			MenuWrite(m++, " System                    \x16", menusub == 6, 0);
-			MenuWrite(m++, " Audio & Video             \x16", menusub == 7, 0);
-			if (spi_uio_cmd16(UIO_GET_OSDMASK, 0) & 1)
+			strcat(s, (minimig_config.autofire & 0x8) ? " ON" : "OFF");			
+			strcpy(s,      " User Port:    ");
+			strcat(s, (minimig_config.userport == mmup_misterfloppy) ? "MiSTer Floppy" : "      MT32-Pi");
+			MenuWrite(m++, s, menusub == 5, 0);
+			if (minimig_config.userport == mmup_misterfloppy) {
+				if (osdMask & 64)
+				{
+					//menumask |= 0x200;   not selectable
+					MenuWrite(m++, "                    Detected", 0, 1);
+				}
+				else {
+					MenuWrite(m++, "                Not Detected", 0, 1);
+					
+				}
+			} else MenuWrite(m++);
+			
+			MenuWrite(m++, " Drives                    \x16", menusub == 6, 0);
+			MenuWrite(m++, " System                    \x16", menusub == 7, 0);
+			MenuWrite(m++, " Audio & Video             \x16", menusub == 8, 0);
+			
+			if (osdMask & 1)
 			{
-				menumask |= 0x100;
-				MenuWrite(m++, " MT32-pi                   \x16", menusub == 8);
+				menumask |= 0x200;
+				MenuWrite(m++, " MT32-pi                   \x16", menusub == 9);
 			}
-
 			MenuWrite(m++);
-			MenuWrite(m++, " Save configuration        \x16", menusub == 9, 0);
-			MenuWrite(m++, " Load configuration        \x16", menusub == 10, 0);
+			MenuWrite(m++, " Save configuration        \x16", menusub == 10, 0);
+			MenuWrite(m++, " Load configuration        \x16", menusub == 11, 0);
 
 			while (m < 14) MenuWrite(m++);
-			MenuWrite(m++, " Reset", menusub == 11, 0);
-			MenuWrite(m, STD_EXIT, menusub == 12, 0);
+			MenuWrite(m++, " Reset", menusub == 12, 0);
+			MenuWrite(m, STD_EXIT, menusub == 13, 0);
 
 			if (!adjvisible) break;
 			firstmenu += adjvisible;
@@ -5864,34 +5881,74 @@ void HandleUI(void)
 		{
 			minimig_config.floppy.drives++;
 			minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+			minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
 			menustate = MENU_MINIMIG_MAIN1;
 		}
 		else if (minus && (minimig_config.floppy.drives > 0) && menusub < 4)
 		{
+			minimig_config.floppy.extDrives[minimig_config.floppy.drives] = 0;  // disable before remove
 			minimig_config.floppy.drives--;
 			minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+			minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
 			menustate = MENU_MINIMIG_MAIN1;
 		}
-		else if (select || recent || minus || plus)
+		else if (select || recent || minus || plus || ((left || right) && menusub < 4))
 		{
 			if (menusub < 4)
 			{
-				ioctl_index = 0;
-				if (df[menusub].status & DSK_INSERTED) // eject selected floppy
-				{
+				if (right || left) {
+					if (df[menusub].status & DSK_INSERTED) // eject selected floppy
+					{
+						FileClose(&df[menusub].file);
+						// We dont delete it, due to race conditions
+						if (df[menusub].fluxFile) df[menusub].fluxFile->closeFile();
+					}
+					bool driveInUse = false;
+					do {
+						if (right) 
+							minimig_config.floppy.extDrives[menusub] = (minimig_config.floppy.extDrives[menusub] + 1) % 5;
+						else {
+							if (minimig_config.floppy.extDrives[menusub] == 0) minimig_config.floppy.extDrives[menusub] = 4; 
+								else minimig_config.floppy.extDrives[menusub]--;
+						}
+						driveInUse = false;
+						// Prevent the same external drive being selected twice
+						if (minimig_config.floppy.extDrives[menusub]) {
+							for (uint32_t drive = 0; drive < 4; drive++)
+								if ((drive != menusub) && (minimig_config.floppy.extDrives[drive] == minimig_config.floppy.extDrives[menusub]))
+									driveInUse = true;
+						}
+					} while (driveInUse);
 					df[menusub].status = 0;
-					FileClose(&df[menusub].file);
+					minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+					minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
 					menustate = MENU_MINIMIG_MAIN1;
-				}
-				else
-				{
-					df[menusub].status = 0;
-					fs_Options = SCANO_DIR;
-					fs_MenuSelect = MENU_MINIMIG_ADFFILE_SELECTED;
-					fs_MenuCancel = MENU_MINIMIG_MAIN1;
-					strcpy(fs_pFileExt, "ADF");
-					if (select) SelectFile(Selected_F[menusub], "ADF", fs_Options, fs_MenuSelect, fs_MenuCancel);
-					else if (recent_init(0)) menustate = MENU_RECENT1;
+				} else {
+					ioctl_index = 0;
+					if (minimig_config.floppy.extDrives[menusub]) {
+						minimig_config.floppy.extDrives[menusub] = 0;
+						minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
+						df[menusub].status = 0;
+						menustate = MENU_MINIMIG_MAIN1;
+					} else
+					if (df[menusub].status & DSK_INSERTED) // eject selected floppy
+					{
+						df[menusub].status = 0;
+						FileClose(&df[menusub].file);
+						// We dont delete it, due to race conditions
+						if (df[menusub].fluxFile) df[menusub].fluxFile->closeFile();
+						menustate = MENU_MINIMIG_MAIN1;
+					}
+					else
+					{
+						df[menusub].status = 0;						
+						fs_Options = SCANO_DIR;
+						fs_MenuSelect = MENU_MINIMIG_ADFFILE_SELECTED;
+						fs_MenuCancel = MENU_MINIMIG_MAIN1;
+						strcpy(fs_pFileExt, "ADF");
+						if (select) SelectFile(Selected_F[menusub], caps_init() ? "ADFSCPIPF": "ADFSCP", fs_Options, fs_MenuSelect, fs_MenuCancel);
+						else if (recent_init(0)) menustate = MENU_RECENT1;
+					}
 				}
 			}
 			else if (menusub == 4)
@@ -5900,45 +5957,52 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 				minimig_ConfigAutofire(minimig_config.autofire, 0x8);
 				menustate = MENU_MINIMIG_MAIN1;
+			} else if (menusub == 5)
+			{
+				minimig_config.userport = minimig_config.userport==mmup_mp32pi ? mmup_misterfloppy : mmup_mp32pi;
+				menustate = MENU_MINIMIG_CHIPSET1;
+				minimig_ConfigUserPort(minimig_config.userport);
+				usleep(300000);  // wait so it can be detected
+				menustate = MENU_MINIMIG_MAIN1;
 			}
 			else if (select)
 			{
-				if (menusub == 5)
+				if (menusub == 6)
 				{
 					menustate = MENU_MINIMIG_DISK1;
 					menusub = 0;
 				}
-				else if (menusub == 6)
+				else if (menusub == 7)
 				{
 					menustate = MENU_MINIMIG_CHIPSET1;
 					menusub = 0;
 				}
-				else if (menusub == 7)
+				else if (menusub == 8)
 				{
 					menustate = MENU_MINIMIG_VIDEO1;
 					menusub = 0;
 				}
-				else if (menusub == 8)
+				else if (menusub == 9)
 				{
 					menusub = 0;
 					menustate = MENU_MT32PI_MAIN1;
 				}
-				else if (menusub == 9)
+				else if (menusub == 10)
 				{
 					menusub = 0;
 					menustate = MENU_MINIMIG_SAVECONFIG1;
 				}
-				else if (menusub == 10)
+				else if (menusub == 11)
 				{
 					menusub = 0;
 					menustate = MENU_MINIMIG_LOADCONFIG1;
 				}
-				else if (menusub == 11)
+				else if (menusub == 12)
 				{
 					menustate = MENU_NONE1;
 					minimig_reset();
 				}
-				else if (menusub == 12)
+				else if (menusub == 13)
 				{
 					menustate = MENU_NONE1;
 				}
@@ -5946,7 +6010,12 @@ void HandleUI(void)
 		}
 		else if (c == KEY_BACKSPACE) // eject all floppies
 		{
-			for (int i = 0; i <= drives; i++) df[i].status = 0;
+			for (int i = 0; i <= drives; i++) {
+				df[i].status = 0;
+				FileClose(&df[i].file);
+				// We dont delete it, due to race conditions
+				if (df[i].fluxFile) df[i].fluxFile->closeFile();
+			}
 			menustate = MENU_MINIMIG_MAIN1;
 		}
 		else if (right)
@@ -8060,6 +8129,7 @@ void menu_process_save()
 }
 
 static char pchar[] = { 0x8C, 0x8E, 0x8F, 0x90, 0x91, 0x7F };
+
 
 #define PROGRESS_CNT    28
 #define PROGRESS_CHARS  (int)(sizeof(pchar)/sizeof(pchar[0]))
