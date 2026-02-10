@@ -5759,7 +5759,7 @@ void HandleUI(void)
 		/* minimig main menu                                              */
 		/******************************************************************/
 	case MENU_MINIMIG_MAIN1:
-		menumask = 0x1FF0;
+		menumask = 0x3FB0;
 		OsdSetTitle("Minimig", OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
 		helptext_idx = HELPTEXT_MAIN;
 
@@ -5805,8 +5805,20 @@ void HandleUI(void)
 						}
 						else {
 							switch (minimig_config.userport == mmup_misterfloppy ? minimig_config.floppy.extDrives[i] : 0) {
-								case 1: strcat(s, "External Drive 0/A"); break;
-								case 2: strcat(s, "External Drive 1/B"); break;
+								case 1: 
+									strcat(s, "External Drive ");
+									if (osdMask & 64)
+										strcat(s, (osdMask & 128) ? "A" : "0");
+									else
+										strcat(s, "0/A");
+										break;
+								case 2: 
+									strcat(s, "External Drive ");
+									if (osdMask & 64)
+										strcat(s, (osdMask & 128) ? "B" : "1");
+									else
+										strcat(s, "1/B");
+									break;
 								case 3: strcat(s, "External Drive 2"); break;
 								case 4: strcat(s, "External Drive 3"); break;
 								default: strcat(s, "* no disk *"); break; // no floppy disk
@@ -5825,30 +5837,37 @@ void HandleUI(void)
 			m = 4;
 			strcpy(s,      " Joystick Swap:          ");
 			strcat(s, (minimig_config.autofire & 0x8) ? " ON" : "OFF");			
-			strcpy(s,      " User Port:    ");
+			MenuWrite(m++, s, menusub == 4, 0);
+			strcpy(s, " User Port:    ");
 			strcat(s, (minimig_config.userport == mmup_misterfloppy) ? "MiSTer Floppy" : "      MT32-Pi");
 			MenuWrite(m++, s, menusub == 5, 0);
 			if (minimig_config.userport == mmup_misterfloppy) {
 				if (osdMask & 64)
 				{
-					//menumask |= 0x200;   not selectable
-					MenuWrite(m++, "                    Detected", 0, 1);
+					if (osdMask & 128)
+					{
+						MenuWrite(m++, "          Detected  (IBM/PC)", 0, 1);
+					}
+					else
+					{
+						MenuWrite(m++, "          Detected (Shugart)", 0, 1);
+					}
 				}
 				else {
 					MenuWrite(m++, "                Not Detected", 0, 1);
-					
 				}
-			} else MenuWrite(m++);
-			
-			MenuWrite(m++, " Drives                    \x16", menusub == 6, 0);
-			MenuWrite(m++, " System                    \x16", menusub == 7, 0);
-			MenuWrite(m++, " Audio & Video             \x16", menusub == 8, 0);
-			
-			if (osdMask & 1)
-			{
-				menumask |= 0x200;
-				MenuWrite(m++, " MT32-pi                   \x16", menusub == 9);
 			}
+			else
+				if (osdMask & 1)
+				{
+					menumask |= 0x40;
+					MenuWrite(m++, "                 Configure \x16", menusub == 6);
+				}
+				else MenuWrite(m++, "                Not Detected", 0, 1);
+			MenuWrite(m++, " Drives                    \x16", menusub == 7, 0);
+			MenuWrite(m++, " System                    \x16", menusub == 8, 0);
+			MenuWrite(m++, " Audio & Video             \x16", menusub == 9, 0);
+			
 			MenuWrite(m++);
 			MenuWrite(m++, " Save configuration        \x16", menusub == 10, 0);
 			MenuWrite(m++, " Load configuration        \x16", menusub == 11, 0);
@@ -5897,6 +5916,14 @@ void HandleUI(void)
 			if (menusub < 4)
 			{
 				if (right || left) {
+					uint16_t osdMask = spi_uio_cmd16(UIO_GET_OSDMASK, 0);
+					uint8_t driveMask = 0x0F;  // all four are available by default
+					if (osdMask & 64) { // MiSTer Floppy detected
+						if (osdMask & 128) { // IBM Floppy drive mode
+							driveMask &= 0x03;
+						}
+					}
+
 					if (df[menusub].status & DSK_INSERTED) // eject selected floppy
 					{
 						FileClose(&df[menusub].file);
@@ -5904,6 +5931,8 @@ void HandleUI(void)
 						if (df[menusub].fluxFile) df[menusub].fluxFile->closeFile();
 					}
 					bool driveInUse = false;
+					uint16_t loops = 0;
+
 					do {
 						if (right) 
 							minimig_config.floppy.extDrives[menusub] = (minimig_config.floppy.extDrives[menusub] + 1) % 5;
@@ -5914,11 +5943,18 @@ void HandleUI(void)
 						driveInUse = false;
 						// Prevent the same external drive being selected twice
 						if (minimig_config.floppy.extDrives[menusub]) {
-							for (uint32_t drive = 0; drive < 4; drive++)
-								if ((drive != menusub) && (minimig_config.floppy.extDrives[drive] == minimig_config.floppy.extDrives[menusub]))
-									driveInUse = true;
+							if ((driveMask & 1 << (minimig_config.floppy.extDrives[menusub] - 1)) == 0)
+								driveInUse = true;
+							else
+								for (uint32_t drive = 0; drive < 4; drive++)
+									if ((drive != menusub) && (minimig_config.floppy.extDrives[drive] == minimig_config.floppy.extDrives[menusub]))
+										driveInUse = true;
 						}
-					} while (driveInUse);
+						loops++;
+					} while (driveInUse && (loops<=4));
+					if (driveInUse) {
+						minimig_config.floppy.extDrives[menusub] = 0;
+					}					
 					df[menusub].status = 0;
 					minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
 					minimig_ConfigFloppyExt(minimig_config.floppy.extDrives[0], minimig_config.floppy.extDrives[1], minimig_config.floppy.extDrives[2], minimig_config.floppy.extDrives[3]);
@@ -5967,22 +6003,22 @@ void HandleUI(void)
 			}
 			else if (select)
 			{
-				if (menusub == 6)
+				if (menusub == 7)
 				{
 					menustate = MENU_MINIMIG_DISK1;
 					menusub = 0;
 				}
-				else if (menusub == 7)
+				else if (menusub == 8)
 				{
 					menustate = MENU_MINIMIG_CHIPSET1;
 					menusub = 0;
 				}
-				else if (menusub == 8)
+				else if (menusub == 9)
 				{
 					menustate = MENU_MINIMIG_VIDEO1;
 					menusub = 0;
 				}
-				else if (menusub == 9)
+				else if (menusub == 6)
 				{
 					menusub = 0;
 					menustate = MENU_MT32PI_MAIN1;
@@ -6116,13 +6152,13 @@ void HandleUI(void)
 			else
 			{
 				menustate = MENU_MINIMIG_MAIN1;
-				menusub = 10;
+				menusub = 11;
 			}
 		}
 		if (menu || left)
 		{
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 10;
+			menusub = 11;
 		}
 		break;
 
@@ -6200,13 +6236,13 @@ void HandleUI(void)
 
 			if (menusub<10) minimig_cfg_save(menusub);
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 9;
+			menusub = 10;
 		}
 		else
 		if (menu || left) // exit menu
 		{
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 9;
+			menusub = 10;
 		}
 		break;
 
@@ -6429,7 +6465,7 @@ void HandleUI(void)
 			else if (menusub == 11)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
-				menusub = 6;
+				menusub = 8;
 			}
 		}
 
@@ -6440,7 +6476,7 @@ void HandleUI(void)
 		else if (back || left)
 		{
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 6;
+			menusub = 8;
 		}
 		break;
 
@@ -6624,7 +6660,7 @@ void HandleUI(void)
 			else if (menusub == 11 && select) // return to previous menu
 			{
 				menustate = MENU_MINIMIG_MAIN1;
-				menusub = 5;
+				menusub = 7;
 			}
 		}
 
@@ -6635,7 +6671,7 @@ void HandleUI(void)
 		else if (back || left)
 		{
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 5;
+			menusub = 7;
 		}
 		break;
 
@@ -6803,7 +6839,7 @@ void HandleUI(void)
 				if (select)
 				{
 					menustate = MENU_MINIMIG_MAIN1;
-					menusub = 7;
+					menusub = 9;
 				}
 				break;
 			}
@@ -6815,7 +6851,7 @@ void HandleUI(void)
 		else if (back || left)
 		{
 			menustate = MENU_MINIMIG_MAIN1;
-			menusub = 7;
+			menusub = 9;
 		}
 		break;
 
