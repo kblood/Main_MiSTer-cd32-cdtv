@@ -19,6 +19,13 @@
 #define MAX_TRACKS (83*2)
 
 
+#define FLUX_CLOCK_SPEED_MHZ  7LL
+#define FLUX_CLOCK_TICK ((long long)(1000/FLUX_CLOCK_SPEED_MHZ))
+#define FLUX_HALF_CLOCK_TICK ((long long)(FLUX_CLOCK_TICK/2))
+#define FLUX_CLOCK_TICK_1_5 ((long long)(FLUX_CLOCK_TICK * 1.5))
+#define FLUX_CLOCK_TICK_2_5 ((long long)(FLUX_CLOCK_TICK * 2.5))
+#define FLUX_MAX_WAITING ((long long)(254590/ FLUX_CLOCK_SPEED_MHZ))
+
 class FluxFile {
 public:
 	// Open Flux based file

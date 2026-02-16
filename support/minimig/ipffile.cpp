@@ -247,30 +247,30 @@ bool IPFFile::fluxRead(uint16_t* outputBuffer, uint32_t numWords) {
 
 		// Encode flux transition information
 		if (m_fluxTime) {
-			while (m_fluxTime > 36370LL) {  // approx 255				
+			while (m_fluxTime > FLUX_MAX_WAITING) {  // approx 255				
 				if (!fluxReady()) return false;
 				// 1 byte left, encode a single tick delay
 				if (bytesLeft == 1) {
 					*bytesOut = 1; bytesLeft--; bytesOut++;
-					m_fluxTime -= 142LL;
+					m_fluxTime -= FLUX_CLOCK_TICK;
 					if (m_fluxTime < 1) m_fluxTime = 1;
 					return true;
 				}
 				// 2 bytes left
 				*bytesOut = 2;   // signal the next byte is a delay only, not transition
 				bytesLeft--; bytesOut++;
-				m_fluxTime -= 142LL;    // even this uses one tick
-				uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_fluxTime + 71LL) * 7LL) / 1000LL), 255LL);
+				m_fluxTime -= FLUX_CLOCK_TICK;    // even this uses one tick
+				uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_fluxTime + FLUX_HALF_CLOCK_TICK) * FLUX_CLOCK_SPEED_MHZ) / 1000LL), 255LL);
 				*bytesOut = convertedTime;
 				bytesOut++; bytesLeft--;
-				m_fluxTime -= (((int64_t)convertedTime) * 1000LL) / 7LL;
+				m_fluxTime -= (((int64_t)convertedTime) * 1000LL) / FLUX_CLOCK_SPEED_MHZ;
 				if (m_fluxTime < 1) m_fluxTime = 1;
 				if (bytesLeft < 1) return true;
 			}
 			// Encode flux transition			
 			if (bytesLeft) {
-				uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_fluxTime + 71LL) * 7LL) / 1000LL), 255LL);
-				m_fluxTime -= (((int64_t)convertedTime) * 1000LL) / 7LL;
+				uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_fluxTime + FLUX_HALF_CLOCK_TICK) * FLUX_CLOCK_SPEED_MHZ) / 1000LL), 255LL);
+				m_fluxTime -= (((int64_t)convertedTime) * 1000LL) / FLUX_CLOCK_SPEED_MHZ;
 				*bytesOut = convertedTime;
 				bytesOut++; bytesLeft--;				
 			}
@@ -288,24 +288,24 @@ bool IPFFile::fluxRead(uint16_t* outputBuffer, uint32_t numWords) {
 		if (m_markIndex) {
 			// We need to send INDEX, but theres a residual from the previous loop. Needs encoding so INDEX appears at the right position
 			if (m_timeSoFar) {
-				while (m_timeSoFar > 142LL) {
+				while (m_timeSoFar > FLUX_CLOCK_TICK) {
 					if (!fluxReady()) return false;
 					// 1 byte left, encode a single tick delay
 					if (bytesLeft == 1) {
 						*bytesOut = 1; bytesLeft--; bytesOut++;
-						m_timeSoFar -= 142LL;
+						m_timeSoFar -= FLUX_CLOCK_TICK;
 						return true;
 					}
 					// More than 1 byte remaining!
 					// Less than 2 ticks (1.5) worth of time remaining?
-					if (m_timeSoFar < 245LL) {
+					if (m_timeSoFar < FLUX_CLOCK_TICK_1_5) {
 						*bytesOut = 1;   // Single delay
 						bytesLeft--; bytesOut++;
 						m_timeSoFar = 0;
 					}
 					else {
 						// Less than 3 ticks (2.5 worth)
-						if (m_timeSoFar < 355LL) {
+						if (m_timeSoFar < FLUX_CLOCK_TICK_2_5) {
 							*bytesOut = 1;    bytesOut++;
 							*bytesOut = 1;    bytesOut++;
 							bytesLeft -= 2;
@@ -315,11 +315,11 @@ bool IPFFile::fluxRead(uint16_t* outputBuffer, uint32_t numWords) {
 							// 3 or more ticks
 							*bytesOut = 2;   // signal the next byte is a delay only, not transition
 							bytesLeft--; bytesOut++;
-							m_timeSoFar -= 142LL;    // even this uses one tick
-							uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_timeSoFar + 71LL) * 7LL) / 1000LL), 255LL);
+							m_timeSoFar -= FLUX_CLOCK_TICK;    // even this uses one tick
+							uint8_t convertedTime = (uint8_t)std::min(std::max(3LL, ((m_timeSoFar + FLUX_HALF_CLOCK_TICK) * FLUX_CLOCK_SPEED_MHZ) / 1000LL), 255LL);
 							*bytesOut = convertedTime;
 							bytesOut++; bytesLeft--;
-							m_timeSoFar -= (((int64_t)convertedTime) * 1000LL) / 7LL;
+							m_timeSoFar -= (((int64_t)convertedTime) * 1000LL) / FLUX_CLOCK_SPEED_MHZ;
 							if (convertedTime <= 3) m_timeSoFar = 0; // just incase
 						}
 					}
@@ -327,7 +327,6 @@ bool IPFFile::fluxRead(uint16_t* outputBuffer, uint32_t numWords) {
 					// Stop if out of data space
 					if (bytesLeft < 1) return true;
 				}
-				m_timeSoFar = 0;
 			}
 
 			m_markIndex = false;
