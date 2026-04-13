@@ -5808,10 +5808,14 @@ void HandleUI(void)
 								case 1: 
 									strcat(s, "External Drive ");
 									if (osdMask & 64)
+									{
 										strcat(s, (osdMask & 128) ? "A" : "0");
+									}
 									else
+									{
 										strcat(s, "0/A");
-										break;
+									}
+									break;
 								case 2: 
 									strcat(s, "External Drive ");
 									if (osdMask & 64)
@@ -5844,14 +5848,12 @@ void HandleUI(void)
 			if (minimig_config.userport == mmup_misterfloppy) {
 				if (osdMask & 64)
 				{
-					if (osdMask & 128)
-					{
-						MenuWrite(m++, "          Detected  (IBM/PC)", 0, 1);
-					}
-					else
-					{
-						MenuWrite(m++, "          Detected (Shugart)", 0, 1);
-					}
+					strcpy(s, "        ");
+					if (osdMask & 128) strcat(s, " ");
+					strcat(s, osdMask & 256 ? "=" : "X");   // Cable type. =Straight, XCrossed
+					strcat(s, " ");
+					strcat(s, osdMask & 128 ? " Detected (IBM/PC)" : " Detected (Shugart)");
+					MenuWrite(m++, s, 0, 1);
 				}
 				else {
 					MenuWrite(m++, "                Not Detected", 0, 1);
