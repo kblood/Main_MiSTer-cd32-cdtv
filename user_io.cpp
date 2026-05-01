@@ -34,6 +34,7 @@
 #include "shmem.h"
 #include "ide.h"
 #include "ide_cdrom.h"
+#include "support/minimig/akiko_cd32.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -3112,6 +3113,7 @@ void user_io_poll()
 		ide_io(1, (sd_req >> 3) & 7);
 		if (sd_req & 0x0100) ide_cdda_send_sector();
 		UpdateDriveStatus();
+		akiko_cd32_poll();
 
 		kbd_fifo_poll();
 
