@@ -1091,7 +1091,81 @@ void cdrom_read(ide_config *ide)
 	pkt_send(ide, ide_buf, cnt * 2048);
 }
 
-static int disc_info(drive_t *drv, uint16_t maxlen) 
+// Read one full 2352-byte raw sector from the CD image at `lba` into `buf`.
+// Used by the Akiko PBX sector DMA path. Returns 0 on success, -1 on error.
+//
+// Source-format handling:
+//   - CHD              : mister_chd_read_sector with length=2352 (CHD always
+//                        stores raw 2352-byte frames internally; CDDA sector
+//                        path at line 1718 already uses this form).
+//   - 2352-byte BIN/ISO: FileSeek + read, no transform.
+//   - 2336-byte (Mode2): zero the 16-byte sync+header, copy 2336 into buf+16.
+//   - 2048-byte cooked : minimal Mode 1 sync header + 2048 user data + zero
+//                        ECC. CD32 doesn't validate ECC so this works for
+//                        booting; games that rely on raw sector contents
+//                        (rare on CD32) won't.
+int cdrom_read_raw_sector(drive_t *drive, uint32_t lba, uint8_t *buf)
+{
+	if (!drive || !buf) return -1;
+
+	bool is_index0 = false;
+	track_t *track = get_track_from_lba(drive, lba, is_index0);
+	if (!track) return -1;
+
+	if (drive->chd_f)
+	{
+		uint32_t chd_lba = lba + drive->track[drive->data_num].chd_offset;
+		if (mister_chd_read_sector(drive->chd_f, chd_lba, 0, 0,
+		                           BYTES_PER_RAW_REDBOOK_FRAME, buf,
+		                           drive->chd_hunkbuf, &drive->chd_hunknum)
+		    != CHDERR_NONE) return -1;
+		return 0;
+	}
+
+	if (!track->f.opened()) return -1;
+
+	uint16_t sz = track->sectorSize;
+	uint32_t pos = track->skip + (lba - track->start) * sz;
+	if (FileSeek(&track->f, pos, SEEK_SET) < 0) return -1;
+
+	if (sz == BYTES_PER_RAW_REDBOOK_FRAME)
+	{
+		if (FileReadAdv(&track->f, buf, BYTES_PER_RAW_REDBOOK_FRAME, -1) <= 0)
+			return -1;
+		return 0;
+	}
+
+	if (sz == 2336)
+	{
+		memset(buf, 0, 16);
+		if (FileReadAdv(&track->f, buf + 16, 2336, -1) <= 0) return -1;
+		return 0;
+	}
+
+	if (sz == BYTES_PER_COOKED_REDBOOK_FRAME)
+	{
+		// Synthesize minimal Mode 1 raw frame: sync(12) + header(4) + data + ECC(0).
+		memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+		buf[0] = 0x00;
+		memset(buf + 1, 0xff, 10);
+		buf[11] = 0x00;
+		// header MSF (BCD) + mode (=1)
+		uint32_t f_lba = lba + REDBOOK_FRAME_PADDING;
+		uint8_t mm = (uint8_t)(f_lba / (REDBOOK_FRAMES_PER_SECOND * 60));
+		uint8_t ss = (uint8_t)((f_lba / REDBOOK_FRAMES_PER_SECOND) % 60);
+		uint8_t ff = (uint8_t)(f_lba % REDBOOK_FRAMES_PER_SECOND);
+		buf[12] = (uint8_t)(((mm / 10) << 4) | (mm % 10));
+		buf[13] = (uint8_t)(((ss / 10) << 4) | (ss % 10));
+		buf[14] = (uint8_t)(((ff / 10) << 4) | (ff % 10));
+		buf[15] = 0x01;
+		if (FileReadAdv(&track->f, buf + 16, 2048, -1) <= 0) return -1;
+		return 0;
+	}
+
+	return -1;
+}
+
+static int disc_info(drive_t *drv, uint16_t maxlen)
 {
 	if (!maxlen) return 0;
 	if (maxlen > 34) maxlen = 34;

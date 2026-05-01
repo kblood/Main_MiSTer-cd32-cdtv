@@ -41,9 +41,18 @@
 // Bridge address class (matches hps_ext.v:127 → akiko_cs).
 #define AKIKO_BRIDGE_ADDR  0xF400
 
-// Status-poll cmd byte. Returns one 16-bit word; bit[11] = akiko_req.
-#define AKIKO_STATUS_CMD   0x63
-#define AKIKO_STATUS_REQ   (1u << 11)
+// Status-poll cmd byte. Returns one 16-bit word; bit[11] = akiko_req,
+// bit[10] = akiko_sec_req (M4 PBX wants a sector pushed).
+#define AKIKO_STATUS_CMD     0x63
+#define AKIKO_STATUS_REQ     (1u << 11)
+#define AKIKO_STATUS_SEC_REQ (1u << 10)
+
+// Sub-channel selector inside the 0xF400 class: io_din[8] = 1 selects the
+// sector channel (hps_ext.v:135, akiko_cs_sec). 0xF400 | 0x100 = 0xF500.
+#define AKIKO_SECTOR_ADDR  0xF500
+
+// PBX sector size (raw Mode-1/Mode-2 frame).
+#define AKIKO_SECTOR_BYTES 2352
 
 // Per-opcode command lengths *excluding* the trailing checksum byte.
 // akiko.cpp:1136 — entries < 0 are "reserved/unsupported".
@@ -84,6 +93,11 @@ static uint8_t  cd_door             = 0;       // door always "closed" for now
 static uint32_t cd_play_start_lba   = 0;       // recorded for M4 (real audio/data)
 static uint32_t cd_play_end_lba     = 0;
 
+// M4 PBX state: cd_data_lba_base is set when cmd 0x04 is issued in DATA mode
+// (cmd[7] bit 7 = 1). On each FPGA sec_req, we read the FPGA's sector_counter
+// and fetch LBA = base + counter. -1 = no data read in progress (push zeros).
+static int32_t  cd_data_lba_base    = -1;
+
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
 
@@ -114,6 +128,19 @@ static bool cd_is_mounted(void)
 		}
 	}
 	return false;
+}
+
+// Find the first mounted CD drive (used by M4 sector fetch). NULL if none.
+static drive_t *cd_find_drive(void)
+{
+	for (int p = 0; p < 2; p++) {
+		for (int d = 0; d < 2; d++) {
+			if (ide_inst[p].drive[d].present && ide_inst[p].drive[d].cd) {
+				return &ide_inst[p].drive[d];
+			}
+		}
+	}
+	return NULL;
 }
 
 // Read the bridge status word. Mirrors ide_check() but kept private to avoid
@@ -227,6 +254,7 @@ static void cmd_stop(const uint8_t *cmd)
 	r[1] = cd_is_mounted() ? 0x00 : (CH_ERR_NODISK | cd_door);
 	cd_playing = 0;
 	cd_paused = 0;
+	cd_data_lba_base = -1;                       // cancel any data-mode read
 	akiko_send_response(r, 2);
 	akiko_dbg("STOP\n");
 }
@@ -277,10 +305,14 @@ static void cmd_multi(const uint8_t *cmd)
 
 	bool data_read = (cmd[7] & 0x80) != 0;
 	if (data_read) {
-		// TODO(M4): data-mode read — DMA cooked sectors to chip RAM.
+		// M4: arm the PBX sector fetcher. cdrom_sector_counter on the FPGA
+		// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
+		// LBA = base + counter holds across the full read pass.
+		cd_data_lba_base = (int32_t)s_lba;
 		r[1] = 0x02;
 	} else {
-		// TODO(M4): start CDDA from cd_play_start_lba.
+		// TODO(post-M4): start CDDA from cd_play_start_lba.
+		cd_data_lba_base = -1;
 		cd_playing = 1;
 		cd_paused = 0;
 		r[1] = 0x42;
@@ -331,6 +363,75 @@ static void cmd_bad(const uint8_t *cmd, uint8_t err_code)
 }
 
 // -----------------------------------------------------------------------------
+// M4 PBX sector channel
+// -----------------------------------------------------------------------------
+
+// Read the FPGA's current cdrom_sector_counter (1-byte read on the sec
+// sub-channel, 0xF500). The bridge presents hps_sec_status on every read
+// strobe; one word is enough.
+static uint8_t akiko_read_sec_counter(void)
+{
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(AKIKO_SECTOR_ADDR);
+	uint16_t w = spi_w(0);
+	DisableIO();
+	return (uint8_t)(w & 0xff);
+}
+
+// Push 2352 bytes via UIO_DMA_WRITE on the sec sub-channel. The bridge
+// pulses hps_sec_done on deselect, which latches sector_ready in the engine
+// and unblocks the PBX state machine.
+static void akiko_push_sector(const uint8_t *buf)
+{
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(AKIKO_SECTOR_ADDR);
+	for (int i = 0; i < AKIKO_SECTOR_BYTES; i++) {
+		spi_w(buf[i]);
+	}
+	DisableIO();
+}
+
+// Service one akiko_sec_req. Reads the engine's current sector_counter,
+// fetches LBA = base + counter from the CD image, and pushes the raw 2352-byte
+// frame back. On any error (no disc, no data read armed, image read failure)
+// we still push 2352 zeros so the engine doesn't stall — the PBX cycle will
+// land but the resulting sector will fail Kickstart's data-checksum (returning
+// junk is preferable to deadlocking the CD32 boot path on a transient).
+static void akiko_handle_sec_req(void)
+{
+	uint8_t counter = akiko_read_sec_counter();
+
+	uint8_t buf[AKIKO_SECTOR_BYTES];
+
+	if (cd_data_lba_base < 0) {
+		akiko_dbg("sec_req but no data read armed (counter=%u)\n", counter);
+		memset(buf, 0, sizeof(buf));
+		akiko_push_sector(buf);
+		return;
+	}
+
+	drive_t *drv = cd_find_drive();
+	if (!drv) {
+		akiko_dbg("sec_req but no CD drive (counter=%u)\n", counter);
+		memset(buf, 0, sizeof(buf));
+		akiko_push_sector(buf);
+		return;
+	}
+
+	uint32_t lba = (uint32_t)cd_data_lba_base + counter;
+	if (cdrom_read_raw_sector(drv, lba, buf) != 0) {
+		akiko_dbg("sec_req lba=%u read FAILED\n", lba);
+		memset(buf, 0, sizeof(buf));
+	} else {
+		akiko_dbg("sec_req lba=%u counter=%u OK\n", lba, counter);
+	}
+
+	akiko_push_sector(buf);
+}
+
+// -----------------------------------------------------------------------------
 // Top-level poll
 // -----------------------------------------------------------------------------
 
@@ -343,6 +444,7 @@ void akiko_cd32_init(void)
 	cd_door          = 0;
 	cd_play_start_lba = 0;
 	cd_play_end_lba   = 0;
+	cd_data_lba_base = -1;
 	cd_last_mounted  = false;
 	akiko_dbg("init\n");
 }
@@ -354,6 +456,7 @@ void akiko_cd32_poll(void)
 	// Re-arm auto-init if media was swapped or just inserted.
 	if (mounted != cd_last_mounted) {
 		cd_initialized   = 0;
+		cd_data_lba_base = -1;               // any in-progress read is stale
 		cd_last_mounted  = mounted;
 		akiko_dbg("media change -> mounted=%d\n", mounted);
 	}
@@ -368,8 +471,18 @@ void akiko_cd32_poll(void)
 		return;                              // one bridge action per poll
 	}
 
-	// 2. Anything for us to drain?
+	// 2. Status poll. sec_req is checked first because PBX has tighter timing
+	//    requirements than the command stream — Kickstart's data-read loop
+	//    expects sectors to land within a few frames of the slot bit being
+	//    written. Both bits can be set concurrently; we'll get the cmd next
+	//    frame.
 	uint16_t status = akiko_read_status();
+
+	if (status & AKIKO_STATUS_SEC_REQ) {
+		akiko_handle_sec_req();
+		return;                              // one bridge action per poll
+	}
+
 	if (!(status & AKIKO_STATUS_REQ)) return;
 
 	// 3. Drain the framed command.
