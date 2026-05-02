@@ -705,10 +705,8 @@ void akiko_cd32_poll(void)
 	}
 
 	// 1. Auto-init: push media-status frame periodically until host echoes
-	//    it back via INFO (cd_initialized -> 2). On real CD32 the boot menu
-	//    sometimes opens cd.device long after first poll, so a one-shot push
-	//    races with that. Re-pushing every ~1s costs nothing and recovers.
-	//    akiko.cpp:1388-1397.
+	//    it back via INFO (cd_initialized -> 2). One-shot loses the boot
+	//    race against BIOS opening cd.device late; re-pushing recovers.
 	static int media_push_throttle = 0;
 	if (mounted && cd_initialized < 2) {
 		bool first = (cd_initialized == 0);
@@ -723,15 +721,14 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	// 1.4 Post-INFO media-status push. Initial one-shot (immediately after
-	//     INFO completes) plus continued periodic pushes every ~2s. The
-	//     CD32 BIOS appears to wait for an ongoing drive-ready ping after
-	//     identification before issuing its first MULTI scan -- a single
-	//     post-INFO push isn't enough on hardware.
+	// 1.4 Post-INFO media-status push. Initial one-shot plus periodic
+	//     heartbeat. Without periodic pushes the BIOS-side RX FSM stalls
+	//     after consuming the first frame (DRIVEXMIT never re-arms with
+	//     only one-shot — BIOS must see ongoing drive activity to advance).
 	static int post_info_throttle = 0;
 	if (cd_initialized == 2) {
 		bool first_post = (cd_post_info_media_push_pending != 0);
-		bool periodic = (post_info_throttle++ % 120) == 0; // ~2s @ 60Hz poll
+		bool periodic = (post_info_throttle++ % 120) == 0; // ~2s @ 60Hz
 		if (first_post || periodic) {
 			cd_post_info_media_push_pending = 0;
 			uint8_t r[2] = { 0x0a, 0x01 };
