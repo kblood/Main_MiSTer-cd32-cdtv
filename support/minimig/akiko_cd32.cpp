@@ -107,7 +107,13 @@ static uint8_t  cd_initialized      = 0;
 static uint8_t  cd_paused           = 0;
 static uint8_t  cd_playing          = 0;       // unused in M3, set by 0x04 (audio)
 static uint8_t  cd_led_state        = 0;
-static uint8_t  cd_door             = 0;       // door always "closed" for now
+// WinUAE akiko.cpp:500 defaults cdrom_door=1 and never clears it. The
+// "door" byte is actually a status mask whose bit 0 = CHERR_DISKPRESENT
+// (AROS chinon.h:63). With cd_door=0 every INFO/STATUS/STOP/PAUSE/MULTI
+// response advertises "no disk present" -- the CD32 BIOS then halts at
+// the spinning-CD splash polling CDINTREQ forever, which is exactly what
+// we observed. Initial value MUST be 1.
+static uint8_t  cd_door             = 1;
 static uint32_t cd_play_start_lba   = 0;       // recorded for M4 (real audio/data)
 static uint32_t cd_play_end_lba     = 0;
 
@@ -632,7 +638,7 @@ void akiko_cd32_init(void)
 	cd_paused        = 0;
 	cd_playing       = 0;
 	cd_led_state     = 0;
-	cd_door          = 0;
+	cd_door          = 1;                          // see static initializer above
 	cd_play_start_lba = 0;
 	cd_play_end_lba   = 0;
 	cd_data_lba_base = -1;
