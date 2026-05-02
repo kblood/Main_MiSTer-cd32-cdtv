@@ -714,7 +714,7 @@ void akiko_cd32_poll(void)
 		bool first = (cd_initialized == 0);
 		bool periodic = (cd_initialized == 1) && ((media_push_throttle++ % 60) == 0);
 		if (first || periodic) {
-			uint8_t r[2] = { 0x0a, 0x01 };   // 0x01 = media present
+			uint8_t r[2] = { 0x0a, 0x01 };   // matches WinUAE cdrom_command_media_status (akiko.cpp:932-936)
 			akiko_send_response(r, 2);
 			if (first) cd_initialized = 1;
 			akiko_diag("[akiko] media-status push (init=%d, %s)",
