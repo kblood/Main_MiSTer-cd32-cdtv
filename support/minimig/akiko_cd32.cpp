@@ -119,6 +119,13 @@ static int32_t  cd_data_lba_base    = -1;
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
 
+// One-shot: push a fresh media-status frame on the next poll *after* INFO
+// has completed. Mimics WinUAE's mediachanged-still-set-after-init quirk
+// (akiko.cpp:1399 fires once cd_initialized reaches 2 if mediachanged was
+// set at boot). Without this, BIOS gets the LED+INFO acks but never sees
+// the second media_status that would unblock its post-init MULTI scan.
+static uint8_t  cd_post_info_media_push_pending = 0;
+
 // TOC streaming state. After cmd_info completes we proactively push TOC
 // entries (cmd 0x06 / cdrom_return_toc_entry) one per poll until the BIOS
 // has seen each point TOC_REPEAT times. WinUAE pushes one per video frame
@@ -369,11 +376,15 @@ static void cmd_info(const uint8_t *cmd)
 	akiko_send_response(r, 20);
 	cd_initialized = 2;
 	akiko_dbg("INFO -> initialized=2\n");
-	// Start streaming TOC entries — BIOS needs them to know how many tracks
-	// the disc has before it will issue MULTI/READ. WinUAE does this from
-	// akiko_handler when mediachanged is set; we tie it to INFO completion
-	// because that's the deterministic point where the host is ready.
+	// Build TOC eagerly (cheap), but DON'T start streaming. WinUAE's BIOS
+	// asks for TOC via MULTI in PLAY mode with seekpos<0 — see cmd_multi.
 	akiko_build_toc();
+	toc_push_idx = -1;                            // armed but not pushing yet
+	// WinUAE leaves mediachanged=1 across boot, so akiko_handler pushes a
+	// second media-status frame *after* cd_initialized hits 2 (lines 1388
+	// and 1399 race). Mimic that: arm one more media-status push so the
+	// BIOS gets the post-INFO "media is here, you can proceed" ping.
+	cd_post_info_media_push_pending = 1;
 }
 
 // 0x01 — STOP. akiko.cpp:989-1003.
@@ -427,7 +438,14 @@ static void cmd_multi(const uint8_t *cmd)
 		return;
 	}
 
-	uint32_t s_lba = msf_to_lba(bcd_to_bin(cmd[1]), bcd_to_bin(cmd[2]), bcd_to_bin(cmd[3]));
+	// WinUAE uses signed msf2lsn — values before pre-gap (MSF 00:00:00)
+	// produce a negative LSN which the BIOS uses as the "scan TOC" sentinel
+	// in the PLAY branch. Match by checking the raw MSF before the lossy
+	// uint subtract.
+	uint32_t s_msf_total = (((uint32_t)bcd_to_bin(cmd[1]) * 60u
+	                       + bcd_to_bin(cmd[2])) * 75u + bcd_to_bin(cmd[3]));
+	bool seek_negative = (s_msf_total < 150u);
+	uint32_t s_lba = s_msf_total - 150u;          // lossy when seek_negative
 	uint32_t e_lba = msf_to_lba(bcd_to_bin(cmd[4]), bcd_to_bin(cmd[5]), bcd_to_bin(cmd[6]));
 
 	cd_play_start_lba = s_lba;
@@ -440,6 +458,16 @@ static void cmd_multi(const uint8_t *cmd)
 		// LBA = base + counter holds across the full read pass.
 		cd_data_lba_base = (int32_t)s_lba;
 		r[1] = 0x02;
+	} else if (seek_negative) {
+		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
+		// Start streaming TOC entries to the BIOS one frame at a time.
+		cd_data_lba_base = -1;
+		cd_playing = 0;
+		cd_paused = 0;
+		toc_push_idx = (toc_point_count > 0) ? 0 : -1;
+		toc_push_throttle = 0;
+		r[1] = 0x42;                              // play-starting status
+		akiko_diag("[akiko] MULTI scan-TOC trigger (points=%u)", toc_point_count);
 	} else {
 		// TODO(post-M4): start CDDA from cd_play_start_lba.
 		cd_data_lba_base = -1;
@@ -449,8 +477,8 @@ static void cmd_multi(const uint8_t *cmd)
 	}
 
 	akiko_send_response(r, 2);
-	akiko_dbg("PLAY %s start=%u end=%u\n",
-		data_read ? "DATA" : "AUDIO", s_lba, e_lba);
+	akiko_dbg("PLAY %s start=%u(%s) end=%u\n",
+		data_read ? "DATA" : "AUDIO", s_lba, seek_negative ? "neg" : "pos", e_lba);
 }
 
 // 0x05 — LED control. cmd[1] bit 7 set means "respond with new state".
@@ -687,6 +715,16 @@ void akiko_cd32_poll(void)
 			           cd_initialized, first ? "first" : "periodic");
 			return;                          // one bridge action per poll
 		}
+	}
+
+	// 1.4 Post-INFO media-status push (one-shot). Mimics WinUAE's
+	//     mediachanged still being set when cd_initialized hits 2.
+	if (cd_post_info_media_push_pending) {
+		cd_post_info_media_push_pending = 0;
+		uint8_t r[2] = { 0x0a, 0x01 };
+		akiko_send_response(r, 2);
+		akiko_diag("[akiko] post-INFO media-status push");
+		return;
 	}
 
 	// 1.5 Stream TOC entries to the BIOS (cmd 0x06 / cdrom_return_toc_entry).
