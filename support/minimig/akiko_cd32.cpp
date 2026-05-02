@@ -119,6 +119,21 @@ static int32_t  cd_data_lba_base    = -1;
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
 
+// TOC streaming state. After cmd_info completes we proactively push TOC
+// entries (cmd 0x06 / cdrom_return_toc_entry) one per poll until the BIOS
+// has seen each point TOC_REPEAT times. WinUAE pushes one per video frame
+// (akiko.cpp:1438-1440). Without this, CD32 BIOS sits at the spinning-CD
+// splash forever — it never sends MULTI/READ until TOC is known.
+//   AKIKO_TOC_MAX_POINTS = 0xA0 + 0xA1 + 0xA2 + up to 99 tracks; cap at 16
+//   for our M5 use case (Cannon Fodder = 2 tracks → 5 points).
+#define AKIKO_TOC_REPEAT       3
+#define AKIKO_TOC_PUSH_PERIOD  4    // one entry every Nth poll = ~16ms-ish
+#define AKIKO_TOC_MAX_POINTS   16
+static uint8_t toc_buffer[AKIKO_TOC_MAX_POINTS * 13];
+static uint8_t toc_point_count      = 0;
+static int16_t toc_push_idx         = -1;   // -1 = idle; else next slot in 3x sequence
+static int     toc_push_throttle    = 0;
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -132,6 +147,11 @@ static inline uint32_t msf_to_lba(uint8_t m, uint8_t s, uint8_t f)
 static inline uint8_t bcd_to_bin(uint8_t b)
 {
 	return (uint8_t)(((b >> 4) * 10u) + (b & 0x0fu));
+}
+
+static inline uint8_t bin_to_bcd(uint8_t v)
+{
+	return (uint8_t)(((v / 10u) << 4) | (v % 10u));
 }
 
 // CD mounted? Use the first IDE port/drive that has a CD. ide.h shows
@@ -248,6 +268,93 @@ static void akiko_send_response(const uint8_t *payload, int len)
 }
 
 // -----------------------------------------------------------------------------
+// TOC build & push (akiko.cpp:758-786, 956-978, 1437-1440)
+// -----------------------------------------------------------------------------
+
+static void toc_pack_entry(int point, uint8_t control, uint32_t msf_or_track)
+{
+	if (toc_point_count >= AKIKO_TOC_MAX_POINTS) return;
+	uint8_t *d = &toc_buffer[toc_point_count * 13];
+	memset(d, 0, 13);
+	d[1] = 1u | ((uint8_t)control << 4);              // adr=1, control in high nibble
+	d[3] = (point < 100) ? bin_to_bcd((uint8_t)point) : (uint8_t)point;
+	if (point == 0xA0 || point == 0xA1) {
+		// "MSF" actually carries the first/last track number in the M slot.
+		d[8] = bin_to_bcd((uint8_t)msf_or_track);
+	} else {
+		uint32_t lsn = msf_or_track + 150u;           // standard 2-second pre-gap
+		uint32_t mins = (lsn / 75u) / 60u;
+		uint32_t secs = (lsn / 75u) % 60u;
+		uint32_t fr   = lsn % 75u;
+		d[8]  = bin_to_bcd((uint8_t)mins);
+		d[9]  = bin_to_bcd((uint8_t)secs);
+		d[10] = bin_to_bcd((uint8_t)fr);
+	}
+	toc_point_count++;
+}
+
+static void akiko_build_toc(void)
+{
+	toc_point_count = 0;
+	toc_push_idx    = -1;
+
+	drive_t *drv = cd_find_drive();
+	if (!drv || drv->track_cnt < 2) {
+		akiko_diag("[akiko] TOC build SKIP (no drive or no tracks)");
+		return;
+	}
+
+	int real_tracks = drv->track_cnt - 1;             // last entry is lead-out
+	if (real_tracks < 1 || real_tracks > 99) {
+		akiko_diag("[akiko] TOC build SKIP (real_tracks=%d)", real_tracks);
+		return;
+	}
+
+	// Use track 1's data/audio attribute for the 0xA0/0xA1/0xA2 entries.
+	uint8_t first_ctrl = (drv->track[0].attr & 0x40) ? 0x04 : 0x00;
+	toc_pack_entry(0xA0, first_ctrl, 1);
+	toc_pack_entry(0xA1, first_ctrl, real_tracks);
+	toc_pack_entry(0xA2, first_ctrl, drv->track[real_tracks].start);
+
+	for (int i = 0; i < real_tracks; i++) {
+		uint8_t ctrl = (drv->track[i].attr & 0x40) ? 0x04 : 0x00;
+		toc_pack_entry(drv->track[i].number, ctrl, drv->track[i].start);
+	}
+
+	toc_push_idx      = 0;
+	toc_push_throttle = 0;
+	akiko_diag("[akiko] TOC built: %u points (%d real tracks, lead-out lba=%u)",
+	           toc_point_count, real_tracks, drv->track[real_tracks].start);
+}
+
+// Push one TOC entry frame. Returns true if a frame was sent (caller should
+// then `return` from the poll so we don't double-action this tick).
+static bool akiko_push_toc_entry(void)
+{
+	if (toc_push_idx < 0) return false;
+	int point_idx = toc_push_idx / AKIKO_TOC_REPEAT;
+	if (point_idx >= toc_point_count) {
+		akiko_diag("[akiko] TOC push complete (%d frames sent)", toc_push_idx);
+		toc_push_idx = -1;
+		return false;
+	}
+	uint8_t r[15];
+	memset(r, 0, sizeof(r));
+	r[0] = 0x06;                                       // cmd opcode echo
+	r[1] = 0x0a;                                       // "unknown but real CD32 sets it"
+	memcpy(r + 2, &toc_buffer[point_idx * 13], 13);
+	int counter = toc_push_idx;
+	r[6] = bin_to_bcd(99);
+	r[7] = bin_to_bcd((uint8_t)((24u + (uint32_t)counter / 75u) % 100u));
+	r[8] = bin_to_bcd((uint8_t)((uint32_t)counter % 75u));
+	akiko_send_response(r, 15);
+	akiko_diag("[akiko] TOC push idx=%d point_idx=%d point=0x%02x ctrl=0x%02x msf=%02x:%02x:%02x",
+	           toc_push_idx, point_idx, r[5], (r[3] >> 4) & 0x0f, r[10], r[11], r[12]);
+	toc_push_idx++;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
 // Per-opcode command handlers
 // -----------------------------------------------------------------------------
 
@@ -262,6 +369,11 @@ static void cmd_info(const uint8_t *cmd)
 	akiko_send_response(r, 20);
 	cd_initialized = 2;
 	akiko_dbg("INFO -> initialized=2\n");
+	// Start streaming TOC entries — BIOS needs them to know how many tracks
+	// the disc has before it will issue MULTI/READ. WinUAE does this from
+	// akiko_handler when mediachanged is set; we tie it to INFO completion
+	// because that's the deterministic point where the host is ready.
+	akiko_build_toc();
 }
 
 // 0x01 — STOP. akiko.cpp:989-1003.
@@ -497,6 +609,9 @@ void akiko_cd32_init(void)
 	cd_play_end_lba   = 0;
 	cd_data_lba_base = -1;
 	cd_last_mounted  = false;
+	toc_point_count  = 0;
+	toc_push_idx     = -1;
+	toc_push_throttle = 0;
 	akiko_dbg("init\n");
 }
 
@@ -549,6 +664,8 @@ void akiko_cd32_poll(void)
 	if (mounted != cd_last_mounted) {
 		cd_initialized   = 0;
 		cd_data_lba_base = -1;               // any in-progress read is stale
+		toc_point_count  = 0;                // force TOC rebuild after next INFO
+		toc_push_idx     = -1;
 		cd_last_mounted  = mounted;
 		akiko_diag("[akiko] media change -> mounted=%d", mounted);
 	}
@@ -569,6 +686,19 @@ void akiko_cd32_poll(void)
 			akiko_diag("[akiko] media-status push (init=%d, %s)",
 			           cd_initialized, first ? "first" : "periodic");
 			return;                          // one bridge action per poll
+		}
+	}
+
+	// 1.5 Stream TOC entries to the BIOS (cmd 0x06 / cdrom_return_toc_entry).
+	//     The CD32 BIOS scans for TOC via these proactive pushes. Without
+	//     them it never sends MULTI/READ — it sits forever on the AMIGA CD32
+	//     spinning-CD splash polling CDINTREQ. Throttled so we don't flood
+	//     the bridge while still much faster than WinUAE's 60Hz framesync.
+	if (cd_initialized == 2 && toc_push_idx >= 0) {
+		if ((toc_push_throttle++ % AKIKO_TOC_PUSH_PERIOD) == 0) {
+			if (akiko_push_toc_entry()) {
+				return;                      // one bridge action per poll
+			}
 		}
 	}
 
