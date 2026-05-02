@@ -721,14 +721,15 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	// 1.4 Post-INFO media-status push. Initial one-shot plus periodic
-	//     heartbeat. Without periodic pushes the BIOS-side RX FSM stalls
-	//     after consuming the first frame (DRIVEXMIT never re-arms with
-	//     only one-shot — BIOS must see ongoing drive activity to advance).
-	static int post_info_throttle = 0;
+	// 1.4 Post-INFO media-status push. v22: ONE-SHOT only (matches
+	//     WinUAE mediachanged path akiko.cpp:1399-1407). The v17 one-shot
+	//     test regressed before the v21 SUBCODE-at-reset RTL fix; with
+	//     SUBCODE now sourced from reset, BIOS no longer needs the
+	//     periodic push as a heartbeat substitute. Continuous pushes may
+	//     keep BIOS in a tight RX-drain loop and prevent MULTI dispatch.
 	if (cd_initialized == 2) {
 		bool first_post = (cd_post_info_media_push_pending != 0);
-		bool periodic = (post_info_throttle++ % 120) == 0; // ~2s @ 60Hz
+		bool periodic = false;
 		if (first_post || periodic) {
 			cd_post_info_media_push_pending = 0;
 			uint8_t r[2] = { 0x0a, 0x01 };
