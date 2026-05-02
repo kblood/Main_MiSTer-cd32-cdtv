@@ -621,8 +621,9 @@ static void akiko_drain_trace(void)
 	spi8(UIO_DMA_READ);
 	spi32_w(AKIKO_TRACE_ADDR);
 
-	// Cap at 32 entries (ring depth) so a runaway loop can't lock us up.
-	for (int i = 0; i < 32; i++) {
+	// Cap at 128 entries (ring depth, matches akiko_bus_trace.v) so a runaway
+	// loop can't lock us up.
+	for (int i = 0; i < 128; i++) {
 		uint8_t b0 = (uint8_t)spi_w(0);  // {wr, addr[6:0]}
 		uint8_t b1 = (uint8_t)spi_w(0);  // data[7:0]
 		uint8_t b2 = (uint8_t)spi_w(0);  // data[15:8]
