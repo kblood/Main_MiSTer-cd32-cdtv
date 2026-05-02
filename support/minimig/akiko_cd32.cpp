@@ -717,22 +717,30 @@ void akiko_cd32_poll(void)
 		akiko_diag("[akiko] media change -> mounted=%d", mounted);
 	}
 
-	// 1. Auto-init: push media-status frame periodically until host echoes
-	//    it back via INFO (cd_initialized -> 2). One-shot loses the boot
-	//    race against BIOS opening cd.device late; re-pushing recovers.
-	static int media_push_throttle = 0;
-	if (mounted && cd_initialized < 2) {
-		bool first = (cd_initialized == 0);
-		bool periodic = (cd_initialized == 1) && ((media_push_throttle++ % 60) == 0);
-		if (first || periodic) {
-			uint8_t r[2] = { 0x0a, 0x01 };   // matches WinUAE cdrom_command_media_status (akiko.cpp:932-936)
-			akiko_send_response(r, 2);
-			if (first) cd_initialized = 1;
-			akiko_diag("[akiko] media-status push (init=%d, %s)",
-			           cd_initialized, first ? "first" : "periodic");
-			return;                          // one bridge action per poll
-		}
-	}
+	// 1. Auto-init: DISABLED in Phase 12.2.
+	//
+	// Trace (Phase 12, NTSC 4c578993): BIOS configured Akiko, set RXCMP=1
+	// (one byte expected), drained the first byte of our 2-byte
+	// media-status push, then went on to write TXCMP=3 (3-byte command
+	// queued in cmd_buf). But TX never fired because tx_can_start is
+	// gated on cdrom_receive_length == 0 (akiko.v:275, matches WinUAE
+	// can_send_command:1208), and our pending push still had length=2
+	// after Phase 12 preserved offset/length on the rxcmp match. End
+	// result: BIOS deadlocked waiting for a STATUS response that could
+	// never be DMA'd because our pre-emptive push held the RX channel.
+	//
+	// Real BIOS protocol does NOT need an unsolicited media-status: cd.device
+	// init issues STATUS/INFO commands itself once Akiko is wired up,
+	// and we respond from cmd_status / cmd_info. The auto-push existed
+	// only to mirror WinUAE akiko.cpp:1389-1392, but that code path
+	// works in WinUAE because it shares the same emulation loop with
+	// the CPU and never races boot-init. On real HPS<->FPGA we lose
+	// the race (push happens before BIOS sets up RXBUFFER/RXCMP), then
+	// the leftover pending response jams everything.
+	//
+	// If cd.device boot ever depends on an unsolicited push, we'll add
+	// one gated on "BIOS has written ADDRMISC and CDFLAG_TXD" (proof
+	// that BIOS is ready to receive RX DMA).
 
 	// 1.4 Post-INFO media-status push. v27 trace finally captured the full
 	//     handshake (CDFLAG_TXD/RXD/ENABLE was being lost to ring overflow
@@ -742,12 +750,16 @@ void akiko_cd32_poll(void)
 	//     push (the WinUAE post-INFO mediachanged ping); drop the periodic
 	//     heartbeat. Hypothesis: the spam is jamming BIOS's RX buffer with
 	//     wrong-shape data and preventing it from advancing.
+	// Phase 12.2: post-INFO push DISABLED for the same reason as the
+	// auto-init push above. Trace shows BIOS sets RXCMP=1 (single-byte
+	// expected) before INFO; after our INFO response it never bumps RXCMP
+	// for a 2-byte status frame. So our 2-byte push gets 1 byte drained,
+	// receive_length stuck at 2, TX permanently blocked, BIOS stalls.
+	// BIOS issues MULTI/STATUS itself in response to its own polling
+	// schedule once cd.device is up — we don't need to prompt it.
 	if (cd_initialized == 2 && cd_post_info_media_push_pending) {
 		cd_post_info_media_push_pending = 0;
-		uint8_t r[2] = { 0x0a, 0x01 };
-		akiko_send_response(r, 2);
-		akiko_diag("[akiko] post-INFO media-status push (one-shot)");
-		return;
+		akiko_diag("[akiko] post-INFO push SUPPRESSED (Phase 12.2)");
 	}
 
 	// 1.5 Auto-TOC drip: DISABLED in Phase 11 (was: push one TOC entry per
