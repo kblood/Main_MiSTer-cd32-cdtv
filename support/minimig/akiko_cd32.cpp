@@ -717,14 +717,23 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	// 1.4 Post-INFO media-status push (one-shot). Mimics WinUAE's
-	//     mediachanged still being set when cd_initialized hits 2.
-	if (cd_post_info_media_push_pending) {
-		cd_post_info_media_push_pending = 0;
-		uint8_t r[2] = { 0x0a, 0x01 };
-		akiko_send_response(r, 2);
-		akiko_diag("[akiko] post-INFO media-status push");
-		return;
+	// 1.4 Post-INFO media-status push. Initial one-shot (immediately after
+	//     INFO completes) plus continued periodic pushes every ~2s. The
+	//     CD32 BIOS appears to wait for an ongoing drive-ready ping after
+	//     identification before issuing its first MULTI scan -- a single
+	//     post-INFO push isn't enough on hardware.
+	static int post_info_throttle = 0;
+	if (cd_initialized == 2) {
+		bool first_post = (cd_post_info_media_push_pending != 0);
+		bool periodic = (post_info_throttle++ % 120) == 0; // ~2s @ 60Hz poll
+		if (first_post || periodic) {
+			cd_post_info_media_push_pending = 0;
+			uint8_t r[2] = { 0x0a, 0x01 };
+			akiko_send_response(r, 2);
+			akiko_diag("[akiko] post-INFO media-status push (%s)",
+			           first_post ? "first" : "periodic");
+			return;
+		}
 	}
 
 	// 1.5 Stream TOC entries to the BIOS (cmd 0x06 / cdrom_return_toc_entry).
