@@ -734,39 +734,29 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	// 1.4 Post-INFO media-status push. v23: first push always; then a
-	//     SLOW heartbeat so BIOS keeps seeing drive activity without
-	//     overwhelming the RX-drain loop. v21 (push every poll, ~6kHz)
-	//     trapped BIOS in C2P. v22 (one-shot only) left BIOS polling
-	//     forever waiting for the next event. Sweet spot: ~1s heartbeat
-	//     mimics WinUAE's 60Hz framesync cadence (akiko.cpp:1380-1407
-	//     akiko_handler runs media-status checks once per frame).
-	static int post_info_throttle = 0;
-	if (cd_initialized == 2) {
-		bool first_post = (cd_post_info_media_push_pending != 0);
-		bool periodic = ((post_info_throttle++ % 3000) == 0); // ~1s @ ~3kHz
-		if (first_post || periodic) {
-			cd_post_info_media_push_pending = 0;
-			uint8_t r[2] = { 0x0a, 0x01 };
-			akiko_send_response(r, 2);
-			akiko_diag("[akiko] post-INFO media-status push (%s)",
-			           first_post ? "first" : "periodic");
-			return;
-		}
+	// 1.4 Post-INFO media-status push. v27 trace finally captured the full
+	//     handshake (CDFLAG_TXD/RXD/ENABLE was being lost to ring overflow
+	//     pre-fix). Result: BIOS does INFO once, then we spam 8K+ unsolicited
+	//     media-status pushes and 21K+ TOC pushes that BIOS never asked for,
+	//     and BIOS never issues MULTI. Phase 11: keep ONLY the one-shot first
+	//     push (the WinUAE post-INFO mediachanged ping); drop the periodic
+	//     heartbeat. Hypothesis: the spam is jamming BIOS's RX buffer with
+	//     wrong-shape data and preventing it from advancing.
+	if (cd_initialized == 2 && cd_post_info_media_push_pending) {
+		cd_post_info_media_push_pending = 0;
+		uint8_t r[2] = { 0x0a, 0x01 };
+		akiko_send_response(r, 2);
+		akiko_diag("[akiko] post-INFO media-status push (one-shot)");
+		return;
 	}
 
-	// 1.5 Stream TOC entries to the BIOS (cmd 0x06 / cdrom_return_toc_entry).
-	//     The CD32 BIOS scans for TOC via these proactive pushes. Without
-	//     them it never sends MULTI/READ — it sits forever on the AMIGA CD32
-	//     spinning-CD splash polling CDINTREQ. Throttled so we don't flood
-	//     the bridge while still much faster than WinUAE's 60Hz framesync.
-	if (cd_initialized == 2 && toc_push_idx >= 0) {
-		if ((toc_push_throttle++ % AKIKO_TOC_PUSH_PERIOD) == 0) {
-			if (akiko_push_toc_entry()) {
-				return;                      // one bridge action per poll
-			}
-		}
-	}
+	// 1.5 Auto-TOC drip: DISABLED in Phase 11 (was: push one TOC entry per
+	//     few polls so BIOS could "discover" TOC without issuing MULTI). With
+	//     v27 we now know BIOS doesn't issue MULTI even with the auto-drip,
+	//     so the drip is just noise that may be jamming the RX buffer.
+	//     If this hypothesis fails (BIOS still doesn't issue MULTI even with
+	//     a quiet bridge), revisit by adding TOC push only in response to a
+	//     real cmd_multi from BIOS.
 
 	// 2. Status poll. sec_req is checked first because PBX has tighter timing
 	//    requirements than the command stream — Kickstart's data-read loop
