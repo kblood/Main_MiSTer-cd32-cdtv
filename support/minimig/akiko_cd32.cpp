@@ -140,7 +140,7 @@ static uint8_t  cd_post_info_media_push_pending = 0;
 //   AKIKO_TOC_MAX_POINTS = 0xA0 + 0xA1 + 0xA2 + up to 99 tracks; cap at 16
 //   for our M5 use case (Cannon Fodder = 2 tracks → 5 points).
 #define AKIKO_TOC_REPEAT       3
-#define AKIKO_TOC_PUSH_PERIOD  4    // one entry every Nth poll = ~16ms-ish
+#define AKIKO_TOC_PUSH_PERIOD  1000 // ~70Hz at our ~70kHz poll = matches WinUAE framesync (60Hz)
 #define AKIKO_TOC_MAX_POINTS   16
 static uint8_t toc_buffer[AKIKO_TOC_MAX_POINTS * 13];
 static uint8_t toc_point_count      = 0;
@@ -346,10 +346,14 @@ static bool akiko_push_toc_entry(void)
 {
 	if (toc_push_idx < 0) return false;
 	int point_idx = toc_push_idx / AKIKO_TOC_REPEAT;
+	// v24: loop TOC drip indefinitely. WinUAE's framesync runs continuously
+	// (akiko.cpp:1438) and BIOS scans rxcmp through all 256 values to find
+	// alignment — a one-shot 15-frame drip is far too short. The MULTI
+	// dispatch (which would normally end the drip via toc_push_idx=-1) only
+	// fires once BIOS finds the right rxcmp window.
 	if (point_idx >= toc_point_count) {
-		akiko_diag("[akiko] TOC push complete (%d frames sent)", toc_push_idx);
-		toc_push_idx = -1;
-		return false;
+		toc_push_idx = 0;
+		point_idx = 0;
 	}
 	uint8_t r[15];
 	memset(r, 0, sizeof(r));
@@ -385,7 +389,15 @@ static void cmd_info(const uint8_t *cmd)
 	// Build TOC eagerly (cheap), but DON'T start streaming. WinUAE's BIOS
 	// asks for TOC via MULTI in PLAY mode with seekpos<0 — see cmd_multi.
 	akiko_build_toc();
-	toc_push_idx = -1;                            // armed but not pushing yet
+	// v24: drip TOC entries autonomously (don't wait for MULTI). WinUAE's
+	// akiko_handler pushes one TOC entry per frame via the framesync path
+	// (akiko.cpp:1438-1441) so the BIOS sees varying data continuously.
+	// Without this drip, BIOS sees the same {0x0a,0x01,0x0b} media-status
+	// frame repeating and never accumulates the right rxcmp alignment to
+	// fire RXDMADONE. With TOC drip, each push has a different point/MSF
+	// and the rxcmp scan eventually crosses the BIOS's expected window.
+	toc_push_idx = 0;
+	toc_push_throttle = 0;
 	// WinUAE leaves mediachanged=1 across boot, so akiko_handler pushes a
 	// second media-status frame *after* cd_initialized hits 2 (lines 1388
 	// and 1399 race). Mimic that: arm one more media-status push so the
@@ -721,15 +733,17 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	// 1.4 Post-INFO media-status push. v22: ONE-SHOT only (matches
-	//     WinUAE mediachanged path akiko.cpp:1399-1407). The v17 one-shot
-	//     test regressed before the v21 SUBCODE-at-reset RTL fix; with
-	//     SUBCODE now sourced from reset, BIOS no longer needs the
-	//     periodic push as a heartbeat substitute. Continuous pushes may
-	//     keep BIOS in a tight RX-drain loop and prevent MULTI dispatch.
+	// 1.4 Post-INFO media-status push. v23: first push always; then a
+	//     SLOW heartbeat so BIOS keeps seeing drive activity without
+	//     overwhelming the RX-drain loop. v21 (push every poll, ~6kHz)
+	//     trapped BIOS in C2P. v22 (one-shot only) left BIOS polling
+	//     forever waiting for the next event. Sweet spot: ~1s heartbeat
+	//     mimics WinUAE's 60Hz framesync cadence (akiko.cpp:1380-1407
+	//     akiko_handler runs media-status checks once per frame).
+	static int post_info_throttle = 0;
 	if (cd_initialized == 2) {
 		bool first_post = (cd_post_info_media_push_pending != 0);
-		bool periodic = false;
+		bool periodic = ((post_info_throttle++ % 3000) == 0); // ~1s @ ~3kHz
 		if (first_post || periodic) {
 			cd_post_info_media_push_pending = 0;
 			uint8_t r[2] = { 0x0a, 0x01 };
