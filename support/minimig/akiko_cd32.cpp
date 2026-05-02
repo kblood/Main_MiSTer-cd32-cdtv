@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <inttypes.h>
 #include <stdbool.h>
 
@@ -28,8 +29,16 @@
 // -----------------------------------------------------------------------------
 // Debug gating
 // -----------------------------------------------------------------------------
+// Forward declaration so the debug macro can use it before its definition.
+static void akiko_diag(const char *fmt, ...);
+
+// Temporarily forced on for M5 hardware boot diagnosis (Cannon Fodder no-CD).
+// Revert by removing this define once the bridge is observed working.
+#define AKIKO_CD32_DEBUG 1
 #ifdef AKIKO_CD32_DEBUG
-	#define akiko_dbg(...) do { printf("[akiko] "); printf(__VA_ARGS__); } while (0)
+	// Route through akiko_diag so output reaches /tmp/akiko_dbg.log instead
+	// of stdout, which Minimig redirects/silences after init.
+	#define akiko_dbg(fmt, ...) akiko_diag("[akiko] " fmt, ##__VA_ARGS__)
 #else
 	#define akiko_dbg(...) do { } while (0)
 #endif
@@ -50,6 +59,15 @@
 // Sub-channel selector inside the 0xF400 class: io_din[8] = 1 selects the
 // sector channel (hps_ext.v:135, akiko_cs_sec). 0xF400 | 0x100 = 0xF500.
 #define AKIKO_SECTOR_ADDR  0xF500
+
+// Trace sub-channel: io_din[7] = 1 selects the akiko_bus_trace ring buffer
+// (hps_ext.v: akiko_cs_trace). Each entry is 4 bytes:
+//   byte 0: bit7 = 1 if write / 0 if read; bits6:0 = addr[7:1] within the
+//           akiko window ($B80000-$B800FE in 2-byte stride)
+//   byte 1: data[7:0]
+//   byte 2: data[15:8]
+//   byte 3: 0xFF if entry valid, 0x00 if ring empty (stop draining)
+#define AKIKO_TRACE_ADDR  0xF480
 
 // PBX sector size (raw Mode-1/Mode-2 frame).
 #define AKIKO_SECTOR_BYTES 2352
@@ -432,6 +450,39 @@ static void akiko_handle_sec_req(void)
 }
 
 // -----------------------------------------------------------------------------
+// Bus trace drain (debug)
+// -----------------------------------------------------------------------------
+
+// Drain the akiko_bus_trace ring buffer (up to 32 entries). For each captured
+// CPU access we emit one line: `[trace] R $B80012 = 0x4711` style. The ring
+// is small, so we drain on every poll to avoid losing entries during a burst
+// of firmware reads/writes.
+static void akiko_drain_trace(void)
+{
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(AKIKO_TRACE_ADDR);
+
+	// Cap at 32 entries (ring depth) so a runaway loop can't lock us up.
+	for (int i = 0; i < 32; i++) {
+		uint8_t b0 = (uint8_t)spi_w(0);  // {wr, addr[6:0]}
+		uint8_t b1 = (uint8_t)spi_w(0);  // data[7:0]
+		uint8_t b2 = (uint8_t)spi_w(0);  // data[15:8]
+		uint8_t b3 = (uint8_t)spi_w(0);  // 0xFF valid, 0x00 empty
+
+		if (b3 == 0) break;              // ring drained
+
+		bool     is_wr = (b0 & 0x80) != 0;
+		uint32_t addr  = 0xB80000u | ((uint32_t)(b0 & 0x7F) << 1);
+		uint16_t data  = (uint16_t)b1 | ((uint16_t)b2 << 8);
+
+		akiko_diag("[trace] %s $%06X = 0x%04X", is_wr ? "W" : "R", addr, data);
+	}
+
+	DisableIO();
+}
+
+// -----------------------------------------------------------------------------
 // Top-level poll
 // -----------------------------------------------------------------------------
 
@@ -449,26 +500,76 @@ void akiko_cd32_init(void)
 	akiko_dbg("init\n");
 }
 
+// Write a one-line diagnostic to /tmp/akiko_dbg.log, bypassing libc stdio
+// buffering. Cheap enough for an event-driven loop. Always compiled in.
+static void akiko_diag(const char *fmt, ...)
+{
+	FILE *f = fopen("/tmp/akiko_dbg.log", "a");
+	if (!f) return;
+	va_list ap; va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fflush(f);
+	fclose(f);
+}
+
 void akiko_cd32_poll(void)
 {
 	bool mounted = cd_is_mounted();
+
+	// Heartbeat: prove poll loop reached us at all. Writes to a dedicated
+	// log file so it survives any stdout redirection MiSTer does after init.
+	static bool first_poll = true;
+	if (first_poll) {
+		first_poll = false;
+		akiko_diag("[akiko] poll alive (first call) mounted=%d", mounted);
+	}
+
+	// Drain bus trace ring first so we always log what the CPU did before
+	// we react to it. Cheap when the ring is empty (4 spi reads + early-out).
+	akiko_drain_trace();
+
+	// While we don't think we're mounted, periodically dump the underlying
+	// ide_inst flags so we can see what state the IDE subsystem is in.
+	// This burns one log line per second until something flips.
+	static int unmounted_dump_throttle = 0;
+	if (!mounted && (unmounted_dump_throttle++ % 60) == 0 && unmounted_dump_throttle < 5*60) {
+		akiko_diag(
+			"[akiko] ide_inst dump: "
+			"[0,0]p=%d/c=%d/chd=%p/f=%p  [0,1]p=%d/c=%d/chd=%p/f=%p",
+			ide_inst[0].drive[0].present, ide_inst[0].drive[0].cd,
+			(void*)ide_inst[0].drive[0].chd_f, (void*)ide_inst[0].drive[0].f,
+			ide_inst[0].drive[1].present, ide_inst[0].drive[1].cd,
+			(void*)ide_inst[0].drive[1].chd_f, (void*)ide_inst[0].drive[1].f
+		);
+	}
 
 	// Re-arm auto-init if media was swapped or just inserted.
 	if (mounted != cd_last_mounted) {
 		cd_initialized   = 0;
 		cd_data_lba_base = -1;               // any in-progress read is stale
 		cd_last_mounted  = mounted;
-		akiko_dbg("media change -> mounted=%d\n", mounted);
+		akiko_diag("[akiko] media change -> mounted=%d", mounted);
 	}
 
-	// 1. Auto-init: first poll after media is mounted, push media-status frame
-	//    *before* the host sends anything. akiko.cpp:1388-1397.
-	if (mounted && cd_initialized == 0) {
-		uint8_t r[2] = { 0x0a, 0x01 };       // 0x01 = media present
-		akiko_send_response(r, 2);
-		cd_initialized = 1;
-		akiko_dbg("auto media-status -> initialized=1\n");
-		return;                              // one bridge action per poll
+	// 1. Auto-init: push media-status frame periodically until host echoes
+	//    it back via INFO (cd_initialized -> 2). On real CD32 the boot menu
+	//    sometimes opens cd.device long after first poll, so a one-shot push
+	//    races with that. Re-pushing every ~1s costs nothing and recovers.
+	//    akiko.cpp:1388-1397.
+	static int media_push_throttle = 0;
+	if (mounted && cd_initialized < 2) {
+		bool first = (cd_initialized == 0);
+		bool periodic = (cd_initialized == 1) && ((media_push_throttle++ % 60) == 0);
+		if (first || periodic) {
+			uint8_t r[2] = { 0x0a, 0x01 };   // 0x01 = media present
+			akiko_send_response(r, 2);
+			if (first) cd_initialized = 1;
+			akiko_diag("[akiko] media-status push (init=%d, %s)",
+			           cd_initialized, first ? "first" : "periodic");
+			return;                          // one bridge action per poll
+		}
 	}
 
 	// 2. Status poll. sec_req is checked first because PBX has tighter timing
@@ -477,6 +578,13 @@ void akiko_cd32_poll(void)
 	//    written. Both bits can be set concurrently; we'll get the cmd next
 	//    frame.
 	uint16_t status = akiko_read_status();
+	static uint16_t last_status = 0xffff;
+	static int status_log_count = 0;
+	if (status != last_status && status_log_count < 200) {
+		akiko_diag("[akiko] status=0x%04x (was 0x%04x)", status, last_status);
+		last_status = status;
+		status_log_count++;
+	}
 
 	if (status & AKIKO_STATUS_SEC_REQ) {
 		akiko_handle_sec_req();

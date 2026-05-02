@@ -279,6 +279,11 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	//TODO: abstract all the bin/cue+chd+iso parsing and reading into a shared class
 	//
 
+	{
+		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
+		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file enter: chdfile=%s\n", chdfile ? chdfile : "(null)"); fclose(_f); }
+	}
+
 	const char *ext = chdfile + strlen(chdfile) - 4;
 	uint32_t total_sector_size = 0;
 
@@ -286,12 +291,18 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	if (strncasecmp(".chd", ext, 4))
 	{
 		//Not a CHD
+		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
+		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file: ext mismatch '%s'\n", ext); fclose(_f); }
 		return 0;
 	}
 	toc_t tmpTOC = { };
 	memset(drv->track, 0, sizeof(drv->track));
 	drv->track_cnt = 0;
 	chd_error err = mister_load_chd(chdfile, &tmpTOC);
+	{
+		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
+		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file: mister_load_chd err=%d (%s) tracks=%d\n", err, err==CHDERR_NONE?"OK":"FAIL", tmpTOC.last); fclose(_f); }
+	}
 	if (err != CHDERR_NONE)
 	{
 		return 0;
