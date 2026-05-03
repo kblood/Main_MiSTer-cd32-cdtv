@@ -1222,14 +1222,14 @@ static void akiko_diag(const char *fmt, ...)
 
 void akiko_cd32_poll(void)
 {
-	// Phase 32.5 — minimal floor. Synchronisation around the framed RX/TX
-	// engines is provided by per-action poll-until-ready barriers
-	// (akiko_wait_status_bit) inside akiko_send_response /
-	// akiko_drain_command. The 20µs floor here covers the sec_req path
-	// where we don't have an explicit "FPGA consumed your sector" bit
-	// to barrier against: without it, the same sec_req fires twice and CF
-	// re-arms PLAY repeatedly. Don't lower below ~10µs without first
-	// adding a counter-advanced check to akiko_handle_sec_req.
+	// Phase 32.6 P3 (rolled back): tried replacing the floor with a SEC_REQ-
+	// drop barrier inside akiko_handle_sec_req, but CF then re-armed PLAY at
+	// 250 Hz (15k arms in 60s vs ~1 Hz baseline) and stalled at black screen.
+	// The framed RX/TX barriers (rx_busy, req-clear) are sufficient on their
+	// own only because their state bit is observable; the sec channel has
+	// no analogous bit (sec_done is internal to the bridge), so a small
+	// floor remains the simplest correct synchronisation. 20µs was the
+	// original known-good value.
 	usleep(20);
 
 	bool mounted = cd_is_mounted();
