@@ -55,6 +55,11 @@ static void akiko_diag(const char *fmt, ...);
 #define AKIKO_STATUS_CMD     0x63
 #define AKIKO_STATUS_REQ     (1u << 11)
 #define AKIKO_STATUS_SEC_REQ (1u << 10)
+// Phase 18: bit[9] = akiko_rx_busy = (cdrom_receive_length != 0). Mirror of
+// WinUAE's cdrom_can_return_data() gate: when set, the FPGA RX engine still
+// has a queued/in-flight response and we must NOT push another frame, or it
+// gets dropped (overwritten in result_buffer before the framer drains it).
+#define AKIKO_STATUS_RX_BUSY (1u << 9)
 
 // Sub-channel selector inside the 0xF400 class: io_din[8] = 1 selects the
 // sector channel (hps_ext.v:135, akiko_cs_sec). 0xF400 | 0x100 = 0xF500.
@@ -323,6 +328,15 @@ static void akiko_build_toc(void)
 		return;
 	}
 
+	// Phase 24 diag: dump every track's raw fields so we can see what the
+	// CHD parser actually populated.
+	for (int i = 0; i <= real_tracks; i++) {
+		akiko_diag("[akiko] TRACK[%d] num=%u attr=0x%02x start=%u length=%u chd_off=%u",
+		           i, drv->track[i].number, drv->track[i].attr,
+		           drv->track[i].start, drv->track[i].length,
+		           drv->track[i].chd_offset);
+	}
+
 	// Use track 1's data/audio attribute for the 0xA0/0xA1/0xA2 entries.
 	uint8_t first_ctrl = (drv->track[0].attr & 0x40) ? 0x04 : 0x00;
 	toc_pack_entry(0xA0, first_ctrl, 1);
@@ -334,7 +348,13 @@ static void akiko_build_toc(void)
 		toc_pack_entry(drv->track[i].number, ctrl, drv->track[i].start);
 	}
 
-	toc_push_idx      = 0;
+	// Phase 19: do NOT auto-arm the drip. WinUAE's akiko_handler only emits
+	// TOC frames when cdrom_toc_counter >= 0, and that counter is set to 0
+	// only inside cdrom_command_multi() at line 1096 — i.e. after BIOS issues
+	// MULTI cmd 0x04 with the negative-MSF "scan TOC" sentinel. Auto-arming
+	// here (and in cmd_info) caused the drip to run forever, BIOS to consume
+	// 700k entries, and never frame LED=1/PLAY because it was stuck in TOC-
+	// scan mode. We keep the build (it's cheap) but leave toc_push_idx = -1.
 	toc_push_throttle = 0;
 	akiko_diag("[akiko] TOC built: %u points (%d real tracks, lead-out lba=%u)",
 	           toc_point_count, real_tracks, drv->track[real_tracks].start);
@@ -346,14 +366,16 @@ static bool akiko_push_toc_entry(void)
 {
 	if (toc_push_idx < 0) return false;
 	int point_idx = toc_push_idx / AKIKO_TOC_REPEAT;
-	// v24: loop TOC drip indefinitely. WinUAE's framesync runs continuously
-	// (akiko.cpp:1438) and BIOS scans rxcmp through all 256 values to find
-	// alignment — a one-shot 15-frame drip is far too short. The MULTI
-	// dispatch (which would normally end the drip via toc_push_idx=-1) only
-	// fires once BIOS finds the right rxcmp window.
+	// Phase 19: hard-stop after points*REPEAT pushes, matching WinUAE
+	// akiko.cpp:974-976. Looping forever kept BIOS in TOC-scan mode and
+	// blocked progression to LED=1/PLAY — BIOS treats counter=-1 as "TOC
+	// transmission complete" and only then advances state.
 	if (point_idx >= toc_point_count) {
-		toc_push_idx = 0;
-		point_idx = 0;
+		toc_push_idx = -1;
+		akiko_diag("[akiko] TOC drip complete (%u points * %d repeat = %d frames)",
+		           toc_point_count, AKIKO_TOC_REPEAT,
+		           toc_point_count * AKIKO_TOC_REPEAT);
+		return false;
 	}
 	uint8_t r[15];
 	memset(r, 0, sizeof(r));
@@ -361,8 +383,11 @@ static bool akiko_push_toc_entry(void)
 	r[1] = 0x0a;                                       // "unknown but real CD32 sets it"
 	memcpy(r + 2, &toc_buffer[point_idx * 13], 13);
 	int counter = toc_push_idx;
+	// Phase 19: match WinUAE akiko.cpp:971-973 byte-for-byte. WinUAE does
+	// NOT take r[7] mod 100 — it lets BCD wrap naturally past 99. Removed
+	// the %100 to avoid drifting after counter/75 >= 76.
 	r[6] = bin_to_bcd(99);
-	r[7] = bin_to_bcd((uint8_t)((24u + (uint32_t)counter / 75u) % 100u));
+	r[7] = bin_to_bcd((uint8_t)(24u + (uint32_t)counter / 75u));
 	r[8] = bin_to_bcd((uint8_t)((uint32_t)counter % 75u));
 	akiko_send_response(r, 15);
 	akiko_diag("[akiko] TOC push idx=%d point_idx=%d point=0x%02x ctrl=0x%02x msf=%02x:%02x:%02x",
@@ -389,20 +414,17 @@ static void cmd_info(const uint8_t *cmd)
 	// Build TOC eagerly (cheap), but DON'T start streaming. WinUAE's BIOS
 	// asks for TOC via MULTI in PLAY mode with seekpos<0 — see cmd_multi.
 	akiko_build_toc();
-	// v24: drip TOC entries autonomously (don't wait for MULTI). WinUAE's
-	// akiko_handler pushes one TOC entry per frame via the framesync path
-	// (akiko.cpp:1438-1441) so the BIOS sees varying data continuously.
-	// Without this drip, BIOS sees the same {0x0a,0x01,0x0b} media-status
-	// frame repeating and never accumulates the right rxcmp alignment to
-	// fire RXDMADONE. With TOC drip, each push has a different point/MSF
-	// and the rxcmp scan eventually crosses the BIOS's expected window.
-	toc_push_idx = 0;
-	toc_push_throttle = 0;
-	// WinUAE leaves mediachanged=1 across boot, so akiko_handler pushes a
-	// second media-status frame *after* cd_initialized hits 2 (lines 1388
-	// and 1399 race). Mimic that: arm one more media-status push so the
-	// BIOS gets the post-INFO "media is here, you can proceed" ping.
-	cd_post_info_media_push_pending = 1;
+	// Phase 21: removed auto-arm of TOC drip and post-INFO media push.
+	// Subagent diff vs WinUAE akiko.cpp:940-954 (cdrom_command_status / INFO)
+	// shows WinUAE does NOTHING after building the TOC — it just bumps
+	// cd_initialized to 2 and waits for BIOS's next command. The TOC drip
+	// counter is set to 0 in EXACTLY ONE place (akiko.cpp:1096), inside
+	// cdrom_command_multi when MULTI 0x04 is issued with seekpos<0 (the
+	// "scan TOC" sentinel). Our cmd_multi at line 502 already does this.
+	// Phase 19.5's auto-arm sent BIOS 15 unsolicited cmd 0x06 frames it
+	// never asked for, which corrupted its rxinx/rxcmp FSM and caused it
+	// to go silent after the drip completed. Removing it should let BIOS
+	// proceed straight from INFO to MULTI 0x04 (data read of boot sector).
 }
 
 // 0x01 — STOP. akiko.cpp:989-1003.
@@ -479,12 +501,18 @@ static void cmd_multi(const uint8_t *cmd)
 	} else if (seek_negative) {
 		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
 		// Start streaming TOC entries to the BIOS one frame at a time.
+		// Phase 23: WinUAE sets r[1] = 0 for scan-TOC (default from line 1057),
+		// not 0x42. The 0x42 "play started" status is reserved for actual
+		// audio play (seekpos >= 0, line 1099). Our 0x42 here was telling
+		// BIOS "play has started" which conflicts with the TOC scan that
+		// follows — likely keeping BIOS in audio-play state machine instead
+		// of letting it transition to data-read after the TOC.
 		cd_data_lba_base = -1;
 		cd_playing = 0;
 		cd_paused = 0;
 		toc_push_idx = (toc_point_count > 0) ? 0 : -1;
 		toc_push_throttle = 0;
-		r[1] = 0x42;                              // play-starting status
+		r[1] = 0x00;                              // scan-TOC: no play-started flag
 		akiko_diag("[akiko] MULTI scan-TOC trigger (points=%u)", toc_point_count);
 	} else {
 		// TODO(post-M4): start CDDA from cd_play_start_lba.
@@ -512,7 +540,12 @@ static void cmd_led(const uint8_t *cmd)
 		r[1] = cd_led_state;
 		akiko_send_response(r, 2);
 	} else {
-		akiko_send_response(r, 1);
+		// Phase 21: WinUAE akiko.cpp:917-922 returns 0 here, dispatcher at
+		// line 1288 calls set_status(DRIVEXMIT) which is "not used by ROM,
+		// PIO mode" (akiko.cpp:416). Net effect = no buffer push, no IRQ.
+		// We were pushing 1 byte + checksum = 2 bytes that BIOS read as
+		// part of the next response, putting our RX buffer 2 bytes ahead
+		// of BIOS's RXCMP tracking. Drop the response entirely.
 	}
 	akiko_dbg("LED cmd1=%02x state=%d\n", cmd[1], cd_led_state);
 }
@@ -601,7 +634,24 @@ static void akiko_handle_sec_req(void)
 		akiko_dbg("sec_req lba=%u read FAILED\n", lba);
 		memset(buf, 0, sizeof(buf));
 	} else {
-		akiko_dbg("sec_req lba=%u counter=%u OK\n", lba, counter);
+		// Phase 25: dump first 32 bytes of every successful read at LBAs 0-32
+		// to verify the data the BIOS sees. ISO9660 PVD at LBA 16 should start
+		// with the sync pattern 00 FF FF FF FF FF FF FF FF FF FF 00 followed
+		// by the header (MSF + mode), then user data starting with 01 'CD001'.
+		if (lba <= 32) {
+			akiko_diag("[akiko] sec_req lba=%u OK bytes[0..31]: "
+				"%02x %02x %02x %02x %02x %02x %02x %02x "
+				"%02x %02x %02x %02x %02x %02x %02x %02x "
+				"%02x %02x %02x %02x %02x %02x %02x %02x "
+				"%02x %02x %02x %02x %02x %02x %02x %02x",
+				lba,
+				buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+				buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+				buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+				buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]);
+		} else {
+			akiko_dbg("sec_req lba=%u counter=%u OK\n", lba, counter);
+		}
 	}
 
 	akiko_push_sector(buf);
@@ -717,64 +767,12 @@ void akiko_cd32_poll(void)
 		akiko_diag("[akiko] media change -> mounted=%d", mounted);
 	}
 
-	// 1. Auto-init: DISABLED in Phase 12.2.
-	//
-	// Trace (Phase 12, NTSC 4c578993): BIOS configured Akiko, set RXCMP=1
-	// (one byte expected), drained the first byte of our 2-byte
-	// media-status push, then went on to write TXCMP=3 (3-byte command
-	// queued in cmd_buf). But TX never fired because tx_can_start is
-	// gated on cdrom_receive_length == 0 (akiko.v:275, matches WinUAE
-	// can_send_command:1208), and our pending push still had length=2
-	// after Phase 12 preserved offset/length on the rxcmp match. End
-	// result: BIOS deadlocked waiting for a STATUS response that could
-	// never be DMA'd because our pre-emptive push held the RX channel.
-	//
-	// Real BIOS protocol does NOT need an unsolicited media-status: cd.device
-	// init issues STATUS/INFO commands itself once Akiko is wired up,
-	// and we respond from cmd_status / cmd_info. The auto-push existed
-	// only to mirror WinUAE akiko.cpp:1389-1392, but that code path
-	// works in WinUAE because it shares the same emulation loop with
-	// the CPU and never races boot-init. On real HPS<->FPGA we lose
-	// the race (push happens before BIOS sets up RXBUFFER/RXCMP), then
-	// the leftover pending response jams everything.
-	//
-	// If cd.device boot ever depends on an unsolicited push, we'll add
-	// one gated on "BIOS has written ADDRMISC and CDFLAG_TXD" (proof
-	// that BIOS is ready to receive RX DMA).
-
-	// 1.4 Post-INFO media-status push. v27 trace finally captured the full
-	//     handshake (CDFLAG_TXD/RXD/ENABLE was being lost to ring overflow
-	//     pre-fix). Result: BIOS does INFO once, then we spam 8K+ unsolicited
-	//     media-status pushes and 21K+ TOC pushes that BIOS never asked for,
-	//     and BIOS never issues MULTI. Phase 11: keep ONLY the one-shot first
-	//     push (the WinUAE post-INFO mediachanged ping); drop the periodic
-	//     heartbeat. Hypothesis: the spam is jamming BIOS's RX buffer with
-	//     wrong-shape data and preventing it from advancing.
-	// Phase 12.2: post-INFO push DISABLED for the same reason as the
-	// auto-init push above. Trace shows BIOS sets RXCMP=1 (single-byte
-	// expected) before INFO; after our INFO response it never bumps RXCMP
-	// for a 2-byte status frame. So our 2-byte push gets 1 byte drained,
-	// receive_length stuck at 2, TX permanently blocked, BIOS stalls.
-	// BIOS issues MULTI/STATUS itself in response to its own polling
-	// schedule once cd.device is up — we don't need to prompt it.
-	if (cd_initialized == 2 && cd_post_info_media_push_pending) {
-		cd_post_info_media_push_pending = 0;
-		akiko_diag("[akiko] post-INFO push SUPPRESSED (Phase 12.2)");
-	}
-
-	// 1.5 Auto-TOC drip: DISABLED in Phase 11 (was: push one TOC entry per
-	//     few polls so BIOS could "discover" TOC without issuing MULTI). With
-	//     v27 we now know BIOS doesn't issue MULTI even with the auto-drip,
-	//     so the drip is just noise that may be jamming the RX buffer.
-	//     If this hypothesis fails (BIOS still doesn't issue MULTI even with
-	//     a quiet bridge), revisit by adding TOC push only in response to a
-	//     real cmd_multi from BIOS.
-
-	// 2. Status poll. sec_req is checked first because PBX has tighter timing
-	//    requirements than the command stream — Kickstart's data-read loop
-	//    expects sectors to land within a few frames of the slot bit being
-	//    written. Both bits can be set concurrently; we'll get the cmd next
-	//    frame.
+	// 0. Status poll moved up so unsolicited pushes (auto-init, post-INFO,
+	// TOC drip) can be gated on FPGA rx_busy. Phase 18: bit[9] = rx_busy =
+	// (cdrom_receive_length != 0). When set, the RX engine still has a
+	// queued/in-flight response in result_buffer; pushing now would
+	// overwrite it and lose data. Mirror of WinUAE's
+	// cdrom_can_return_data() gate.
 	uint16_t status = akiko_read_status();
 	static uint16_t last_status = 0xffff;
 	static int status_log_count = 0;
@@ -782,6 +780,53 @@ void akiko_cd32_poll(void)
 		akiko_diag("[akiko] status=0x%04x (was 0x%04x)", status, last_status);
 		last_status = status;
 		status_log_count++;
+	}
+	const bool rx_idle = !(status & AKIKO_STATUS_RX_BUSY);
+
+	// 1. Auto-init: WinUAE akiko.cpp:1388-1392 pushes a media-status frame
+	// when cd_initialized == 0 && media-present. BIOS uses this to learn
+	// "media is here" before issuing LED/INFO. Phase 16: re-enabled now
+	// that Phase 14 NVRAM and Phase 15 partial-RX delivery are working.
+	// Without this, our trace shows BIOS doing LED+INFO drains via the
+	// partial-RX path (RXCMP bumped 4 → 30) but never issuing PLAY/MULTI:
+	// it's still in "expecting media-status" mode after INFO.
+	if (mounted && cd_initialized == 0 && rx_idle) {
+		uint8_t r[2];
+		r[0] = 0x0a;                                         // CDS_MEDIA_STATUS opcode
+		r[1] = 0x01;                                         // media present
+		akiko_send_response(r, 2);
+		cd_initialized = 1;
+		akiko_diag("[akiko] auto-init media-status push: opcode=0x0a status=0x01 (cd_initialized=1)");
+	}
+
+	// Phase 20: post-INFO media-status push DISABLED (was Phase 15-19.x).
+	// Subagent diff vs WinUAE akiko.cpp:1399-1407 shows the post-INFO push
+	// is GATED on `mediachanged == 1`, which the auto-init push at
+	// cd_initialized==0 already CONSUMED (akiko.cpp:1390-1392). On a cold
+	// boot WinUAE therefore fires post-INFO ZERO times. Our unconditional
+	// `cd_post_info_media_push_pending=1` in cmd_info was sending a
+	// duplicate/spurious frame after BIOS had already accepted INFO,
+	// likely racing the BIOS state machine and preventing it from
+	// advancing to LED(1)/PLAY/MULTI. Drop it entirely to match WinUAE's
+	// cold-boot behavior; only the auto-init push above should fire.
+	(void)cd_post_info_media_push_pending;
+
+	// 1.5 Auto-TOC drip: re-enabled in Phase 17, gated on rx_idle in Phase 18.
+	// BIOS RXCMP after INFO+post-INFO goes 4,6,7,...,15,30 — the +15 jump from
+	// RXCMP=15 to 30 indicates BIOS is waiting for a 15-byte TOC frame to land
+	// at offset 30. WinUAE pushes one TOC entry per video frame
+	// (akiko.cpp:1438-1440). Throttle accumulates only when the engine is
+	// idle — pushing into a busy buffer would silently drop the entry.
+	if (cd_initialized == 2 && toc_push_idx >= 0 && rx_idle) {
+		// Throttle: WinUAE pushes one TOC entry per video frame (~50 Hz).
+		// Phase 19.6: prior /20 throttle bursted all 15 frames in ~1s
+		// (Phase 18 measured ~60 kHz effective poll rate). /1200 brings
+		// us roughly back to 50 Hz and gives BIOS time to process each
+		// frame's RXDMADONE before the next overwrite.
+		if (++toc_push_throttle >= 1200) {
+			toc_push_throttle = 0;
+			akiko_push_toc_entry();
+		}
 	}
 
 	if (status & AKIKO_STATUS_SEC_REQ) {
