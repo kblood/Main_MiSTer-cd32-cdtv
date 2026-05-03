@@ -1106,9 +1106,13 @@ void cdrom_read(ide_config *ide)
 // Used by the Akiko PBX sector DMA path. Returns 0 on success, -1 on error.
 //
 // Source-format handling:
-//   - CHD              : mister_chd_read_sector with length=2352 (CHD always
-//                        stores raw 2352-byte frames internally; CDDA sector
-//                        path at line 1718 already uses this form).
+//   - CHD              : per-track sectorSize: 2352 = flat copy; 2336 = zero
+//                        16-byte sync+header then read 2336 into buf+16; 2048
+//                        = synth Mode 1 sync header then read 2048 into buf+16.
+//                        CHD only stores raw 2352 for MODE1_RAW/MODE2_RAW; for
+//                        cooked MODE1/MODE2 the CHD frame holds only the user
+//                        bytes (offset 0 of the 2448 frame), so a flat 2352
+//                        copy gives the BIOS user-data-where-sync-should-be.
 //   - 2352-byte BIN/ISO: FileSeek + read, no transform.
 //   - 2336-byte (Mode2): zero the 16-byte sync+header, copy 2336 into buf+16.
 //   - 2048-byte cooked : minimal Mode 1 sync header + 2048 user data + zero
@@ -1125,12 +1129,63 @@ int cdrom_read_raw_sector(drive_t *drive, uint32_t lba, uint8_t *buf)
 
 	if (drive->chd_f)
 	{
-		uint32_t chd_lba = lba + drive->track[drive->data_num].chd_offset;
-		if (mister_chd_read_sector(drive->chd_f, chd_lba, 0, 0,
-		                           BYTES_PER_RAW_REDBOOK_FRAME, buf,
-		                           drive->chd_hunkbuf, &drive->chd_hunknum)
-		    != CHDERR_NONE) return -1;
-		return 0;
+		// Phase 24 (CD32 native Akiko): use the per-track chd_offset from
+		// the track that owns this LBA, not drive->data_num. mister_chd.cpp:153
+		// computes offset = (sector_cnt + pregap - track.start) per track —
+		// CHD pads each track to a multiple of 4 sectors, so the BIOS-LBA →
+		// CHD-LBA delta differs per track. The original code worked for
+		// typical single-data-track CDs (where data_num always lands on
+		// track 0) but fails on multi-data-track CHDs like Cannon Fodder
+		// CD32: the data_num picker at line 360 has no break and ends up
+		// on the LAST data track, whose chd_offset (~ -223 unsigned wrap)
+		// then breaks every read for the FIRST data track.
+		uint32_t chd_lba = lba + track->chd_offset;
+		uint16_t sz = track->sectorSize;
+
+		if (sz == BYTES_PER_RAW_REDBOOK_FRAME)
+		{
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 0, 0,
+			                           BYTES_PER_RAW_REDBOOK_FRAME, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		if (sz == 2336)
+		{
+			memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 16, 0,
+			                           2336, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		if (sz == BYTES_PER_COOKED_REDBOOK_FRAME)
+		{
+			// Phase 26: cooked MODE1 CHD frame stores user data at offset 0;
+			// synthesize the 12-byte sync + 4-byte MSF/mode header so the
+			// BIOS sees a real raw 2352-byte frame.
+			memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+			buf[0] = 0x00;
+			memset(buf + 1, 0xff, 10);
+			buf[11] = 0x00;
+			uint32_t f_lba = lba + REDBOOK_FRAME_PADDING;
+			uint8_t mm = (uint8_t)(f_lba / (REDBOOK_FRAMES_PER_SECOND * 60));
+			uint8_t ss = (uint8_t)((f_lba / REDBOOK_FRAMES_PER_SECOND) % 60);
+			uint8_t ff = (uint8_t)(f_lba % REDBOOK_FRAMES_PER_SECOND);
+			buf[12] = (uint8_t)(((mm / 10) << 4) | (mm % 10));
+			buf[13] = (uint8_t)(((ss / 10) << 4) | (ss % 10));
+			buf[14] = (uint8_t)(((ff / 10) << 4) | (ff % 10));
+			buf[15] = 0x01;
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 16, 0,
+			                           BYTES_PER_COOKED_REDBOOK_FRAME, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		return -1;
 	}
 
 	if (!track->f.opened()) return -1;
