@@ -308,6 +308,10 @@ static uint16_t akiko_read_status(void)
 	return res;
 }
 
+// Forward decl: cmd_subq (early in dispatch table) reads the FPGA sector
+// counter via the helper defined later in the M4 PBX block.
+static uint8_t akiko_read_sec_counter(void);
+
 // Active-poll barrier: read status repeatedly until the masked bit matches
 // `want_set`, or `max_iters` reached. Each iteration is a SPI status read
 // (~µs), so this is a microsecond-scale wait that completes as soon as the
@@ -725,15 +729,96 @@ static void cmd_led(const uint8_t *cmd)
 	akiko_dbg("LED cmd1=%02x state=%d\n", cmd[1], cd_led_state);
 }
 
-// 0x06 — SUBQ. akiko.cpp returns 15 bytes of Q-channel data. For MVP we send
-// all-zero. Real subcode synthesis is post-M4.
+// 0x06 — SUBQ. WinUAE akiko.cpp:1124-1134 + cd_qcode at 706-755.
+// Response layout (15 bytes):
+//   r[0]    = cmd echo
+//   r[1]    = 0
+//   r[2..14] = 13-byte Q-code payload, of which 11 are used:
+//     [2+0] reserved
+//     [2+1] CtlAdr (control nibble in high, adr=1 in low)
+//     [2+2] Track (BCD)
+//     [2+3] Index (BCD, always 1 for our purposes)
+//     [2+4..6] TrackPos M/S/F (BCD, relative to track start with 2-sec pre-gap)
+//     [2+7] reserved
+//     [2+8..10] DiskPos M/S/F (BCD, absolute with 2-sec pre-gap)
+//     [2+11..12] reserved
+// If qcode is invalid (no play / no read), set r[2+2]=0x80 sentinel and
+// leave the rest zero — mirrors WinUAE's `qcode_valid==0` early-return.
 static void cmd_subq(const uint8_t *cmd)
 {
 	uint8_t r[15];
 	memset(r, 0, sizeof(r));
 	r[0] = cmd[0];
+
+	drive_t *drv = cd_find_drive();
+	uint32_t cur_lba = 0;
+	bool valid = false;
+
+	if (drv) {
+		if (cd_data_lba_base >= 0) {
+			// Active data read: counter gives offset within the burst.
+			cur_lba = (uint32_t)cd_data_lba_base + akiko_read_sec_counter();
+			valid = true;
+		} else if (cd_playing && cd_play_start_lba > 0) {
+			// Audio play: we don't track elapsed frames yet, so report
+			// start position. WinUAE's qcode advances per-frame from
+			// the host audio thread; we'll wire that in P4.
+			cur_lba = cd_play_start_lba;
+			valid = true;
+		}
+	}
+
+	if (!valid) {
+		r[2 + 2] = 0x80;                    // qcode-invalid sentinel
+		akiko_send_response(r, 15);
+		return;
+	}
+
+	// Locate the track containing cur_lba (linear scan; track_cnt is small).
+	int trk_idx = 0;
+	int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+	for (int i = 0; i < real_tracks; i++) {
+		uint32_t end = (i + 1 < drv->track_cnt) ? drv->track[i + 1].start
+		                                        : drv->track[i].start + drv->track[i].length;
+		if (cur_lba >= drv->track[i].start && cur_lba < end) {
+			trk_idx = i;
+			break;
+		}
+	}
+
+	const track_t &t = drv->track[trk_idx];
+	// CtlAdr: track attr already holds the control bits in the high nibble
+	// (0x40 = data, 0x00 = audio). adr=1 in low nibble (current Q-mode).
+	uint8_t ctl_adr = (uint8_t)((t.attr & 0xf0) | 0x01);
+
+	// MSF positions, with 2-second pre-gap. Saturate trk_lsn at 0 if
+	// cur_lba sits before the track start (shouldn't happen in steady
+	// state but defensive).
+	uint32_t trk_lsn  = (cur_lba >= t.start) ? (cur_lba - t.start) + 150u : 150u;
+	uint32_t disk_lsn = cur_lba + 150u;
+
+	uint32_t tm = (trk_lsn / 75u) / 60u;
+	uint32_t ts = (trk_lsn / 75u) % 60u;
+	uint32_t tf =  trk_lsn % 75u;
+	uint32_t dm = (disk_lsn / 75u) / 60u;
+	uint32_t ds = (disk_lsn / 75u) % 60u;
+	uint32_t df =  disk_lsn % 75u;
+
+	r[2 + 0] = 0;
+	r[2 + 1] = ctl_adr;
+	r[2 + 2] = bin_to_bcd((uint8_t)t.number);
+	r[2 + 3] = bin_to_bcd(1);                       // Index 1
+	r[2 + 4] = bin_to_bcd((uint8_t)tm);
+	r[2 + 5] = bin_to_bcd((uint8_t)ts);
+	r[2 + 6] = bin_to_bcd((uint8_t)tf);
+	r[2 + 7] = 0;
+	r[2 + 8] = bin_to_bcd((uint8_t)dm);
+	r[2 + 9] = bin_to_bcd((uint8_t)ds);
+	r[2 + 10] = bin_to_bcd((uint8_t)df);
+
 	akiko_send_response(r, 15);
-	akiko_dbg("SUBQ (stub)\n");
+	akiko_dbg("SUBQ trk=%u lba=%u tpos=%u:%u:%u dpos=%u:%u:%u\n",
+	          t.number, cur_lba, tm, ts, tf, dm, ds, df);
 }
 
 // Catch-all for unknown / reserved opcodes. akiko.cpp:1161-1191 style.
