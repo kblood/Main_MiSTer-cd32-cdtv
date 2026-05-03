@@ -22,6 +22,7 @@
 #include <sys/stat.h>     // mkdir() for /media/fat/saves/Minimig
 #include <errno.h>
 #include <unistd.h>       // unlink, fsync
+#include <time.h>         // clock_gettime for akiko_diag timestamp
 
 #include "../../spi.h"
 #include "../../user_io.h"
@@ -307,6 +308,20 @@ static uint16_t akiko_read_status(void)
 	return res;
 }
 
+// Active-poll barrier: read status repeatedly until the masked bit matches
+// `want_set`, or `max_iters` reached. Each iteration is a SPI status read
+// (~µs), so this is a microsecond-scale wait that completes as soon as the
+// FPGA actually shows the expected state — vs a fixed usleep which waits
+// the worst case every time. Returns true if the expected state was seen.
+static bool akiko_wait_status_bit(uint16_t mask, bool want_set, int max_iters)
+{
+	for (int i = 0; i < max_iters; i++) {
+		uint16_t s = akiko_read_status();
+		if (((s & mask) != 0) == want_set) return true;
+	}
+	return false;
+}
+
 // -----------------------------------------------------------------------------
 // Bridge transactions
 // -----------------------------------------------------------------------------
@@ -344,6 +359,13 @@ static int akiko_drain_command(uint8_t *buf)
 	}
 
 	DisableIO();
+
+	// Barrier: wait until the FPGA's TX engine clears its REQ bit. Without
+	// this the next status read at top of poll can still show REQ=1 (stale)
+	// and we'd re-drain garbage as a phantom command. Bounded to 200 iters
+	// (~200µs); typical case is 1-3.
+	akiko_wait_status_bit(AKIKO_STATUS_REQ, false, 200);
+
 	return total;
 }
 
@@ -374,6 +396,12 @@ static void akiko_send_response(const uint8_t *payload, int len)
 	}
 	DisableIO();
 
+	// Barrier: wait until the FPGA's RX engine registers our payload by
+	// raising rx_busy. Without this, the next status read at top of poll
+	// can return rx_busy=0 (stale), and the gating logic for auto-init /
+	// TOC drip / NVR save would push another response on top of this one.
+	// Bounded to 200 iters (~200µs of SPI reads); typical case is 1-3.
+	akiko_wait_status_bit(AKIKO_STATUS_RX_BUSY, true, 200);
 
 #if AKIKO_CD32_DEBUG
 	akiko_dbg("TX %d bytes:", total);
@@ -864,6 +892,10 @@ static bool akiko_nvram_save_to_disk(void)
 // Push 2352 bytes via UIO_DMA_WRITE on the sec sub-channel. The bridge
 // pulses hps_sec_done on deselect, which latches sector_ready in the engine
 // and unblocks the PBX state machine.
+//
+// Loop uses spi_w (which respects SSPI_ACK back-pressure). The "fast" block
+// helpers skip the ack handshake and race past the bridge — confirmed to
+// drop bytes on this engine.
 static void akiko_push_sector(const uint8_t *buf)
 {
 	EnableIO();
@@ -881,9 +913,23 @@ static void akiko_push_sector(const uint8_t *buf)
 // we still push 2352 zeros so the engine doesn't stall — the PBX cycle will
 // land but the resulting sector will fail Kickstart's data-checksum (returning
 // junk is preferable to deadlocking the CD32 boot path on a transient).
+//
+// Phase 32.6: bucketed timing instrumentation. WinUAE 6.0.3 reaches CF "GO
+// FOR IT" in ~40s; we're 5-15x slower. Three phases per sec_req can swallow
+// time: (a) sector_counter SPI read, (b) cdrom_read_raw_sector (CHD seek +
+// hunk decode), (c) push_sector (2352 byte-by-byte SPI w/ ACK). Sum µs spent
+// in each across N sectors and emit one log line per bucket so we can see
+// where the bottleneck actually lives before optimizing.
 static void akiko_handle_sec_req(void)
 {
+	struct timespec ts0, ts1, ts2, ts3;
+	static int64_t phase_a_us = 0, phase_b_us = 0, phase_c_us = 0;
+	static uint32_t bucket_count = 0;
+	const uint32_t BUCKET_SIZE = 256;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts0);
 	uint8_t counter = akiko_read_sec_counter();
+	clock_gettime(CLOCK_MONOTONIC, &ts1);
 
 	uint8_t buf[AKIKO_SECTOR_BYTES];
 
@@ -906,25 +952,38 @@ static void akiko_handle_sec_req(void)
 	if (cdrom_read_raw_sector(drv, lba, buf) != 0) {
 		akiko_dbg("sec_req lba=%u read FAILED\n", lba);
 		memset(buf, 0, sizeof(buf));
-	} else {
-		// Lightweight per-sector log throttled to one line every 64 sectors,
-		// so the log volume stays low (~1500 lines for a full ~95k-sector
-		// CD) while still letting us observe progress and detect stalls
-		// (long gap between consecutive sec_req entries = CF stuck reading).
-		if ((counter & 0x3F) == 0) {
-			akiko_diag("[akiko] sec_req lba=%u counter=%u OK", lba, counter);
-		}
-		// TEMP DIAG: dump first 16 bytes of every read in low-LBA region
-		// (CDFS bootstrap area) so we can see what CF is being fed.
-		if (lba < 200) {
-			akiko_diag("[akiko] sec_req lba=%u bytes[0..15]: "
-				"%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-				lba, buf[0],buf[1],buf[2],buf[3], buf[4],buf[5],buf[6],buf[7],
-				buf[8],buf[9],buf[10],buf[11], buf[12],buf[13],buf[14],buf[15]);
-		}
 	}
+	clock_gettime(CLOCK_MONOTONIC, &ts2);
 
 	akiko_push_sector(buf);
+	clock_gettime(CLOCK_MONOTONIC, &ts3);
+
+	// Signed math throughout — when tv_nsec wraps across a second, the diff
+	// is genuinely negative until the tv_sec component compensates. Casting
+	// to unsigned mid-computation produces 2^64-class garbage values.
+	#define TS_DELTA_US(a, b) \
+		(((int64_t)(b).tv_sec  - (int64_t)(a).tv_sec ) * 1000000LL + \
+		 ((int64_t)(b).tv_nsec - (int64_t)(a).tv_nsec) / 1000LL)
+	phase_a_us += TS_DELTA_US(ts0, ts1);
+	phase_b_us += TS_DELTA_US(ts1, ts2);
+	phase_c_us += TS_DELTA_US(ts2, ts3);
+	#undef TS_DELTA_US
+	bucket_count++;
+
+	if (bucket_count >= BUCKET_SIZE) {
+		akiko_diag("[akiko] sec_req timing N=%u: ctr_read=%lld chd_read=%lld push=%lld (us total) "
+		           "= %lld/%lld/%lld us avg, last lba=%u",
+		           bucket_count,
+		           (long long)phase_a_us,
+		           (long long)phase_b_us,
+		           (long long)phase_c_us,
+		           (long long)(phase_a_us / bucket_count),
+		           (long long)(phase_b_us / bucket_count),
+		           (long long)(phase_c_us / bucket_count),
+		           lba);
+		phase_a_us = phase_b_us = phase_c_us = 0;
+		bucket_count = 0;
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1065,6 +1124,9 @@ static void akiko_diag(const char *fmt, ...)
 {
 	FILE *f = fopen("/tmp/akiko_dbg.log", "a");
 	if (!f) return;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	fprintf(f, "[%6lu.%06lu] ", (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000));
 	va_list ap; va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
@@ -1075,17 +1137,15 @@ static void akiko_diag(const char *fmt, ...)
 
 void akiko_cd32_poll(void)
 {
-	// Phase 32.5 — REQUIRED throttle. Without this, the poll runs faster
-	// than the FPGA bridge can update its status word, and we see stale
-	// rx_busy/sec_req bits. CF then either pushes responses on top of
-	// each other or misses sec_req cycles, and stalls in a tight
-	// LED→PAUSE→PLAY loop reading lba 5-33 forever. Empirical: 200µs
-	// (~5000 polls/sec) reliably gets CF past the filesystem area into
-	// game data (lba 25k+); the heavier per-cmd akiko_dbg logging in
-	// pre-Phase-32.5 builds happened to add ~150µs/cmd which masked the
-	// problem. Don't remove without first proving the bridge can drive
-	// status updates at <200µs latency.
-	usleep(200);
+	// Phase 32.5 — minimal floor. Synchronisation around the framed RX/TX
+	// engines is provided by per-action poll-until-ready barriers
+	// (akiko_wait_status_bit) inside akiko_send_response /
+	// akiko_drain_command. The 20µs floor here covers the sec_req path
+	// where we don't have an explicit "FPGA consumed your sector" bit
+	// to barrier against: without it, the same sec_req fires twice and CF
+	// re-arms PLAY repeatedly. Don't lower below ~10µs without first
+	// adding a counter-advanced check to akiko_handle_sec_req.
+	usleep(20);
 
 	bool mounted = cd_is_mounted();
 
@@ -1148,14 +1208,29 @@ void akiko_cd32_poll(void)
 	}
 #endif
 
-	// Re-arm auto-init if media was swapped or just inserted.
+	// Re-arm auto-init if media was swapped or just inserted. Phase 32.6:
+	// also queue a media-absent push (0x0a/0x00) on mount->unmount so the
+	// CD32 BIOS sees the eject and falls back to "no disc" — without this
+	// the BIOS holds onto its last-mounted media state forever and never
+	// re-detects when a new CD is inserted via OSD. Mirror of WinUAE
+	// akiko.cpp:1399-1407 (mediachanged push).
+	static bool media_absent_push_pending = false;
 	if (mounted != cd_last_mounted) {
 		cd_initialized   = 0;
 		cd_data_lba_base = -1;               // any in-progress read is stale
 		toc_point_count  = 0;                // force TOC rebuild after next INFO
 		toc_push_idx     = -1;
+		if (!mounted) {
+			// Just ejected — arm the absent push (gated on rx_idle below).
+			media_absent_push_pending = true;
+		} else {
+			// Just inserted — auto-init below will re-fire 0x0a/0x01;
+			// any pending absent push is moot.
+			media_absent_push_pending = false;
+		}
 		cd_last_mounted  = mounted;
-		akiko_diag("[akiko] media change -> mounted=%d", mounted);
+		akiko_diag("[akiko] media change -> mounted=%d (absent_push_pending=%d)",
+		           mounted, media_absent_push_pending);
 	}
 
 	// 0. Status poll moved up so unsolicited pushes (auto-init, post-INFO,
@@ -1190,6 +1265,17 @@ void akiko_cd32_poll(void)
 		akiko_send_response(r, 2);
 		cd_initialized = 1;
 		akiko_diag("[akiko] auto-init media-status push: opcode=0x0a status=0x01 (cd_initialized=1)");
+	}
+
+	// Phase 32.6: pending eject notification. Fired once per mount->unmount
+	// edge; cleared on send. rx_idle gating same as auto-init.
+	if (media_absent_push_pending && !mounted && rx_idle) {
+		uint8_t r[2];
+		r[0] = 0x0a;                                         // CDS_MEDIA_STATUS opcode
+		r[1] = 0x00;                                         // media absent
+		akiko_send_response(r, 2);
+		media_absent_push_pending = false;
+		akiko_diag("[akiko] eject media-status push: opcode=0x0a status=0x00");
 	}
 
 	// Phase 20: post-INFO media-status push DISABLED (was Phase 15-19.x).
