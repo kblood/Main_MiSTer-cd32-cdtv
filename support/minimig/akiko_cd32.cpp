@@ -133,6 +133,16 @@ static uint32_t cd_play_end_lba     = 0;
 // and fetch LBA = base + counter. -1 = no data read in progress (push zeros).
 static int32_t  cd_data_lba_base    = -1;
 
+// Audio-play notification state (mirror of WinUAE cdrom_audiotimeout,
+// akiko.cpp:1411-1435). cmd_multi acks PLAY AUDIO synchronously with 0x42
+// ("play starting"), but BIOS won't advance past the audio-cued state until
+// it sees the asynchronous opcode-0x04 follow-up frame. Values:
+//    2,1 -> countdown to "play started" emission (CDS_PLAYING|2)
+//   -1   -> stop audio engine (placeholder until Phase 33), advance to -2
+//   -2   -> emit "play ended" (CDS_PLAYEND)
+//   -3   -> emit "play failed" (CDS_ERROR)
+static int8_t   cd_audio_timeout    = 0;
+
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
 
@@ -439,6 +449,24 @@ static void cmd_info(const uint8_t *cmd)
 	// proceed straight from INFO to MULTI 0x04 (data read of boot sector).
 }
 
+// Async play-state notification — WinUAE cdrom_playend_notify (akiko.cpp:
+// 1110-1121). Emitted by the poll loop after a MULTI audio command, never
+// in synchronous response to a command frame.
+//   status  0 = started   -> CDS_PLAYING | 0x02 | door
+//   status  1 = ended     -> CDS_PLAYEND | door  (==door since CDS_PLAYEND=0)
+//   status -1 = failed    -> CDS_ERROR   | door
+static void emit_playend_notify(int status)
+{
+	uint8_t r[2];
+	r[0] = 0x04;
+	if (status < 0)        r[1] = CDS_ERROR;
+	else if (status == 0)  r[1] = CDS_PLAYING | 0x02;
+	else                   r[1] = CDS_PLAYEND;
+	r[1] |= cd_door;
+	akiko_send_response(r, 2);
+	akiko_dbg("PLAYEND_NOTIFY status=%d -> %02x\n", status, r[1]);
+}
+
 // 0x01 — STOP. akiko.cpp:989-1003.
 static void cmd_stop(const uint8_t *cmd)
 {
@@ -448,6 +476,11 @@ static void cmd_stop(const uint8_t *cmd)
 	cd_playing = 0;
 	cd_paused = 0;
 	cd_data_lba_base = -1;                       // cancel any data-mode read
+	// If a play-started ack is still pending from a prior MULTI audio that
+	// just got STOPped, swallow it. Conversely, a play-ended timeout (-2/-1)
+	// is a legitimate "engine just finished" signal and stays armed so BIOS
+	// sees the natural end-of-play frame.
+	if (cd_audio_timeout > 0) cd_audio_timeout = 0;
 	akiko_send_response(r, 2);
 	akiko_dbg("STOP\n");
 }
@@ -537,11 +570,19 @@ static void cmd_multi(const uint8_t *cmd)
 		r[1] = 0x00;                              // scan-TOC: no play-started flag
 		akiko_diag("[akiko] MULTI scan-TOC trigger (points=%u)", toc_point_count);
 	} else {
-		// TODO(post-M4): start CDDA from cd_play_start_lba.
+		// PLAY AUDIO. Synchronous ack first (0x42 = "play starting"), then
+		// the poll loop emits the asynchronous "play started" follow-up via
+		// the cd_audio_timeout state machine. BIOS gates audio-cued game
+		// progress on the async frame — without it, titles that start a
+		// CDDA cue (Banshee, Speris Legacy, JP3) hang. Real audio output
+		// arrives in Phase 33 (CDDA streaming).
+		// TODO(Phase 33): replace with CDDA pump arming using
+		// cd_play_start_lba/cd_play_end_lba (already captured above).
 		cd_data_lba_base = -1;
 		cd_playing = 1;
 		cd_paused = 0;
 		r[1] = 0x42;
+		cd_audio_timeout = 2;
 	}
 
 	akiko_send_response(r, 2);
@@ -727,6 +768,7 @@ void akiko_cd32_init(void)
 	cd_play_start_lba = 0;
 	cd_play_end_lba   = 0;
 	cd_data_lba_base = -1;
+	cd_audio_timeout = 0;
 	cd_last_mounted  = false;
 	toc_point_count  = 0;
 	toc_push_idx     = -1;
@@ -849,6 +891,33 @@ void akiko_cd32_poll(void)
 			toc_push_throttle = 0;
 			akiko_push_toc_entry();
 		}
+	}
+
+	// Audio-play notification state machine (mirrors WinUAE akiko_handler,
+	// akiko.cpp:1411-1435). Only steps when the RX engine is idle so we
+	// never overwrite an in-flight reply with the play-state frame.
+	// Decrements through 2->1 then emits "play started"; advances -1->-2
+	// then emits "play ended"; emits "play failed" on -3.
+	if (cd_audio_timeout != 0 && rx_idle) {
+		if (cd_audio_timeout > 1) {
+			cd_audio_timeout--;
+		} else if (cd_audio_timeout == 1) {
+			emit_playend_notify(0);
+			cd_audio_timeout = 0;
+		} else if (cd_audio_timeout == -1) {
+			// Phase 33 will tear down the CDDA pump here. For now we
+			// just advance to the play-ended emission.
+			cd_audio_timeout = -2;
+		} else if (cd_audio_timeout == -2) {
+			emit_playend_notify(1);
+			cd_playing = 0;
+			cd_audio_timeout = 0;
+		} else if (cd_audio_timeout == -3) {
+			emit_playend_notify(-1);
+			cd_playing = 0;
+			cd_audio_timeout = 0;
+		}
+		return;                              // one bridge action per poll
 	}
 
 	if (status & AKIKO_STATUS_SEC_REQ) {
