@@ -20,6 +20,7 @@
 #include "hardware.h"
 #include "cd.h"
 #include "ide.h"
+#include "support/minimig/akiko_cd32.h"
 
 #if 0
 #define dbg_printf     printf
@@ -1815,13 +1816,23 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	ide_inst[num].drive[drv].paused = 0;
 	ide_inst[num].drive[drv].play_start_lba = 0;
 	ide_inst[num].drive[drv].play_end_lba = 0;
+	const char *path = NULL;
 	if (strlen(filename))
 	{
-		const char *path = getFullPath(filename);
+		path = getFullPath(filename);
 		res = load_chd_file(&ide_inst[num].drive[drv], path);
 		if (!res) res = load_cue_file(&ide_inst[num].drive[drv], path);
 		if (!res) res = load_iso_file(&ide_inst[num].drive[drv], path);
 	}
+
+	// Phase 32.5.1: notify the CD32 Akiko bridge of the new CD image so
+	// it can pick the right per-game NVRAM save slot. No-op for non-Minimig
+	// cores (the akiko poll only runs from user_io.cpp's Minimig branch),
+	// but the path-tracking state is harmless for them. Pass empty path on
+	// unmount or on failed load so the bridge clears its active slot.
+	// load_*_file return the image name on success, NULL on failure.
+	akiko_cd32_set_cd_path((path && res) ? path : "");
+
 	return res;
 }
 

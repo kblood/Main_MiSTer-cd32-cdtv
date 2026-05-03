@@ -19,11 +19,15 @@
 #include <stdarg.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <sys/stat.h>     // mkdir() for /media/fat/saves/Minimig
+#include <errno.h>
+#include <unistd.h>       // unlink, fsync
 
 #include "../../spi.h"
 #include "../../user_io.h"
 #include "../../ide.h"
 #include "../../ide_cdrom.h"
+#include "../../hardware.h"   // GetTimer / CheckTimer
 #include "akiko_cd32.h"
 
 // -----------------------------------------------------------------------------
@@ -32,16 +36,28 @@
 // Forward declaration so the debug macro can use it before its definition.
 static void akiko_diag(const char *fmt, ...);
 
-// Temporarily forced on for M5 hardware boot diagnosis (Cannon Fodder no-CD).
-// Revert by removing this define once the bridge is observed working.
-#define AKIKO_CD32_DEBUG 1
-#ifdef AKIKO_CD32_DEBUG
+// Verbose per-command/per-status diag (TX/RX byte dumps, status change
+// chatter). Costly: every line is a synchronous fopen/fwrite/fclose to
+// tmpfs, and once gameplay starts CF generates 200+ of these per second.
+// Off in production. (The poll-loop throttle in akiko_cd32_poll is what
+// was historically masked by this logging — see comment there.)
+#define AKIKO_CD32_DEBUG 0
+#if AKIKO_CD32_DEBUG
 	// Route through akiko_diag so output reaches /tmp/akiko_dbg.log instead
 	// of stdout, which Minimig redirects/silences after init.
 	#define akiko_dbg(fmt, ...) akiko_diag("[akiko] " fmt, ##__VA_ARGS__)
 #else
 	#define akiko_dbg(...) do { } while (0)
 #endif
+
+// Bus-trace ring drain. Independent flag because the per-entry logging
+// dwarfs everything else (>90% of log volume during gameplay). HOWEVER —
+// the drain itself MUST run every poll regardless: the trace ring in
+// akiko_hps_bridge appears to back-pressure the CPU when full, so an
+// undrained ring stalls CF on dense bus activity (e.g. C2P traffic
+// during early boot — observed: CF stuck at lba 33 vs lba 25k+ with
+// drain enabled). When this flag is 0 we still drain, just silently.
+#define AKIKO_BUS_TRACE 0
 
 // -----------------------------------------------------------------------------
 // WinUAE-derived constants (akiko.cpp)
@@ -64,6 +80,27 @@ static void akiko_diag(const char *fmt, ...);
 // Sub-channel selector inside the 0xF400 class: io_din[8] = 1 selects the
 // sector channel (hps_ext.v:135, akiko_cs_sec). 0xF400 | 0x100 = 0xF500.
 #define AKIKO_SECTOR_ADDR  0xF500
+
+// Phase 32: NVRAM save-dump sub-channel. io_din[6] = 1 selects the NVRAM
+// host port (akiko_hps_bridge.v + akiko_nvram.v). 0xF400 | 0x40 = 0xF440.
+// Reading streams 1024 bytes (auto-incrementing internal addr counter,
+// resets on cs rise). Any write here pulses host_clear_dirty.
+#define AKIKO_NVRAM_ADDR              0xF440
+#define AKIKO_NVRAM_BYTES             1024
+#define AKIKO_NVRAM_DIR               "/media/fat/saves/Minimig"
+// Pre-Phase-32.5.1 single-file fallback. Used only when the dirty-debounce
+// poll path tries to save and we have no per-game CD path active (e.g. the
+// player wrote to EEPROM before any CD got mounted, or the path-setter hook
+// hasn't fired yet). After 32.5.1 normal use writes to per-game files
+// `cd32-<hash>.nvr` in AKIKO_NVRAM_DIR; legacy `cd32.nvr` is read on first
+// load only as a one-shot migration when no per-game file exists.
+#define AKIKO_NVRAM_FILE_LEGACY       "/media/fat/saves/Minimig/cd32.nvr"
+#define AKIKO_STATUS_NVR_DIRTY        (1u << 7)   // hps_ext bit 7
+// Throttle: poll the dirty bit at most once per second; once seen, wait
+// this long for the dirty state to stabilize before saving (debounces
+// bursty BIOS FlashFile commits, which may take multiple I2C writes).
+#define AKIKO_NVRAM_POLL_PERIOD_MS    1000
+#define AKIKO_NVRAM_DIRTY_DEBOUNCE_MS 5000
 
 // Trace sub-channel: io_din[7] = 1 selects the akiko_bus_trace ring buffer
 // (hps_ext.v: akiko_cs_trace). Each entry is 4 bytes:
@@ -168,9 +205,46 @@ static uint8_t toc_point_count      = 0;
 static int16_t toc_push_idx         = -1;   // -1 = idle; else next slot in 3x sequence
 static int     toc_push_throttle    = 0;
 
+// Phase 32.5.1: per-game NVRAM. cd_save_path_active is the full path of the
+// per-CD save file currently mirrored in FPGA BRAM (`""` when no CD is
+// mounted). cd_save_load_pending is set by akiko_cd32_set_cd_path() (CD
+// swap) or akiko_cd32_init() (Minimig core reconfig wiped BRAM) and cleared
+// by the poll loop after the load actually fires. cd_save_dirty_observed
+// tracks whether we've ever seen the FPGA dirty flag asserted since the
+// current save was loaded — used to skip the pre-swap flush when the player
+// never touched EEPROM (avoids overwriting a real save with the synthesized
+// FlashFile init from a different CD).
+static char cd_save_path_active[256] = {0};
+static bool cd_save_load_pending     = false;
+static bool cd_save_dirty_observed   = false;
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+// FNV-1a 64-bit. Stable across runs/builds, no endian concerns. Used to map
+// a CD basename to a 16-hex-char save filename slot.
+static uint64_t fnv1a_64(const char *s)
+{
+	uint64_t h = 0xcbf29ce484222325ULL;
+	while (*s) {
+		h ^= (uint64_t)(uint8_t)*s++;
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+// Build `<AKIKO_NVRAM_DIR>/cd32-<hash>.nvr` from the basename of `cd_path`.
+// We hash the basename (not the full path) so the same CHD in a different
+// folder maps to the same save slot. Comparison is case-sensitive — Linux
+// FS, and CD32 CHDs are typically named in a stable case anyway.
+static void compute_save_path(const char *cd_path, char *out, size_t outsz)
+{
+	const char *base = strrchr(cd_path, '/');
+	base = base ? base + 1 : cd_path;
+	uint64_t h = fnv1a_64(base);
+	snprintf(out, outsz, "%s/cd32-%016" PRIx64 ".nvr", AKIKO_NVRAM_DIR, h);
+}
 
 static inline uint32_t msf_to_lba(uint8_t m, uint8_t s, uint8_t f)
 {
@@ -300,7 +374,8 @@ static void akiko_send_response(const uint8_t *payload, int len)
 	}
 	DisableIO();
 
-#ifdef AKIKO_CD32_DEBUG
+
+#if AKIKO_CD32_DEBUG
 	akiko_dbg("TX %d bytes:", total);
 	for (int i = 0; i < total; i++) printf(" %02x", out[i]);
 	printf("\n");
@@ -651,6 +726,132 @@ static uint8_t akiko_read_sec_counter(void)
 	return (uint8_t)(w & 0xff);
 }
 
+// -----------------------------------------------------------------------------
+// Phase 32: NVRAM save-dump (UIO 0xF440)
+// -----------------------------------------------------------------------------
+// Drain all 1024 NVRAM bytes from the FPGA via UIO_DMA_READ on the nvr
+// sub-channel. The bridge presents bytes from an internal address counter
+// that resets to 0 on cs rising and increments per uio_rd. host_dout has
+// 1-cycle BRAM latency; cs is held many cycles before the first read so
+// the first byte is valid by then.
+static void akiko_nvram_dump(uint8_t *out_1024)
+{
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(AKIKO_NVRAM_ADDR);
+	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
+		out_1024[i] = (uint8_t)spi_w(0);
+	}
+	DisableIO();
+}
+
+// Phase 32.5: load 1024 bytes from a save file into FPGA NVRAM BRAM via
+// the host write port (UIO_DMA_WRITE on the nvr sub-channel). Returns true
+// if the file existed at the right size and was streamed; false (silently)
+// otherwise — in which case BRAM keeps its synthesized FlashFile-magic
+// init, behaving as a fresh empty EEPROM (the pre-Phase-32.5 cold-boot
+// behavior). The bridge does NOT touch the dirty flag on writes, so
+// loading does not provoke an immediate re-save on the next poll.
+static bool akiko_nvram_load_from_path(const char *path)
+{
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		akiko_diag("[akiko] NVR load skip: no file at %s (errno=%d)",
+		           path, errno);
+		return false;
+	}
+	if (st.st_size != AKIKO_NVRAM_BYTES) {
+		akiko_diag("[akiko] NVR load skip: %s wrong size %lld (want %d)",
+		           path, (long long)st.st_size, AKIKO_NVRAM_BYTES);
+		return false;
+	}
+
+	uint8_t buf[AKIKO_NVRAM_BYTES];
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		akiko_diag("[akiko] NVR fopen(%s, rb) failed: errno=%d",
+		           path, errno);
+		return false;
+	}
+	size_t got = fread(buf, 1, AKIKO_NVRAM_BYTES, f);
+	fclose(f);
+	if (got != AKIKO_NVRAM_BYTES) {
+		akiko_diag("[akiko] NVR fread short: got %zu want %d",
+		           got, AKIKO_NVRAM_BYTES);
+		return false;
+	}
+
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(AKIKO_NVRAM_ADDR);
+	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
+		spi_w(buf[i]);
+	}
+	DisableIO();
+
+	akiko_diag("[akiko] NVR loaded %d bytes from %s", AKIKO_NVRAM_BYTES, path);
+	return true;
+}
+
+// Atomic save to a specific path: dump → write to .tmp → fsync → rename →
+// unlink stale .tmp. Returns true on success. Failure paths log via
+// akiko_diag and leave the dirty flag set (next poll re-tries). Note that
+// akiko_nvram_dump on the bridge auto-clears the dirty flag at end of the
+// read burst, so a successful save is naturally idempotent.
+static bool akiko_nvram_save_to_path(const char *path)
+{
+	uint8_t buf[AKIKO_NVRAM_BYTES];
+	akiko_nvram_dump(buf);
+
+	// Ensure target directory exists. mkdir is fine if it already does
+	// (EEXIST). Other errors surface during fopen.
+	if (mkdir(AKIKO_NVRAM_DIR, 0755) != 0 && errno != EEXIST) {
+		akiko_diag("[akiko] NVR mkdir(%s) failed: errno=%d", AKIKO_NVRAM_DIR, errno);
+		// fall through — fopen below will report the real failure
+	}
+
+	char tmp_path[300];
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+	FILE *f = fopen(tmp_path, "wb");
+	if (!f) {
+		akiko_diag("[akiko] NVR fopen(%s) failed: errno=%d", tmp_path, errno);
+		return false;
+	}
+	size_t wrote = fwrite(buf, 1, AKIKO_NVRAM_BYTES, f);
+	int    flush = fflush(f);
+	int    fsy   = fsync(fileno(f));
+	int    cls   = fclose(f);
+	if (wrote != AKIKO_NVRAM_BYTES || flush != 0 || fsy != 0 || cls != 0) {
+		akiko_diag("[akiko] NVR write incomplete: wrote=%zu flush=%d fsync=%d close=%d",
+		           wrote, flush, fsy, cls);
+		unlink(tmp_path);
+		return false;
+	}
+
+	if (rename(tmp_path, path) != 0) {
+		akiko_diag("[akiko] NVR rename(%s -> %s) failed: errno=%d",
+		           tmp_path, path, errno);
+		unlink(tmp_path);
+		return false;
+	}
+
+	akiko_diag("[akiko] NVR saved %d bytes to %s", AKIKO_NVRAM_BYTES, path);
+	return true;
+}
+
+// Save wrapper used by the dirty-debounce path in poll. Resolves to the
+// per-game save filename if a CD path is active; otherwise falls back to
+// the legacy single-file slot so writes that happen with no CD context
+// (shouldn't normally occur, but cheap insurance) aren't silently dropped.
+static bool akiko_nvram_save_to_disk(void)
+{
+	const char *target = (cd_save_path_active[0])
+		? cd_save_path_active
+		: AKIKO_NVRAM_FILE_LEGACY;
+	return akiko_nvram_save_to_path(target);
+}
+
 // Push 2352 bytes via UIO_DMA_WRITE on the sec sub-channel. The bridge
 // pulses hps_sec_done on deselect, which latches sector_ready in the engine
 // and unblocks the PBX state machine.
@@ -697,23 +898,20 @@ static void akiko_handle_sec_req(void)
 		akiko_dbg("sec_req lba=%u read FAILED\n", lba);
 		memset(buf, 0, sizeof(buf));
 	} else {
-		// Phase 25: dump first 32 bytes of every successful read at LBAs 0-32
-		// to verify the data the BIOS sees. ISO9660 PVD at LBA 16 should start
-		// with the sync pattern 00 FF FF FF FF FF FF FF FF FF FF 00 followed
-		// by the header (MSF + mode), then user data starting with 01 'CD001'.
-		if (lba <= 32) {
-			akiko_diag("[akiko] sec_req lba=%u OK bytes[0..31]: "
-				"%02x %02x %02x %02x %02x %02x %02x %02x "
-				"%02x %02x %02x %02x %02x %02x %02x %02x "
-				"%02x %02x %02x %02x %02x %02x %02x %02x "
-				"%02x %02x %02x %02x %02x %02x %02x %02x",
-				lba,
-				buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-				buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-				buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-				buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]);
-		} else {
-			akiko_dbg("sec_req lba=%u counter=%u OK\n", lba, counter);
+		// Lightweight per-sector log throttled to one line every 64 sectors,
+		// so the log volume stays low (~1500 lines for a full ~95k-sector
+		// CD) while still letting us observe progress and detect stalls
+		// (long gap between consecutive sec_req entries = CF stuck reading).
+		if ((counter & 0x3F) == 0) {
+			akiko_diag("[akiko] sec_req lba=%u counter=%u OK", lba, counter);
+		}
+		// TEMP DIAG: dump first 16 bytes of every read in low-LBA region
+		// (CDFS bootstrap area) so we can see what CF is being fed.
+		if (lba < 200) {
+			akiko_diag("[akiko] sec_req lba=%u bytes[0..15]: "
+				"%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+				lba, buf[0],buf[1],buf[2],buf[3], buf[4],buf[5],buf[6],buf[7],
+				buf[8],buf[9],buf[10],buf[11], buf[12],buf[13],buf[14],buf[15]);
 		}
 	}
 
@@ -724,10 +922,12 @@ static void akiko_handle_sec_req(void)
 // Bus trace drain (debug)
 // -----------------------------------------------------------------------------
 
-// Drain the akiko_bus_trace ring buffer (up to 32 entries). For each captured
-// CPU access we emit one line: `[trace] R $B80012 = 0x4711` style. The ring
-// is small, so we drain on every poll to avoid losing entries during a burst
-// of firmware reads/writes.
+// Drain the akiko_bus_trace ring buffer. ALWAYS COMPILED IN — the ring
+// back-pressures the CPU when full, and an undrained ring stalls CF on
+// dense bus activity (root cause of "stuck at lba 33"). Per-entry logging
+// is gated on AKIKO_BUS_TRACE because at >90% of log volume during
+// gameplay it dominates I/O cost; the bytes are still consumed off the
+// ring, just discarded silently.
 static void akiko_drain_trace(void)
 {
 	EnableIO();
@@ -744,11 +944,15 @@ static void akiko_drain_trace(void)
 
 		if (b3 == 0) break;              // ring drained
 
+#if AKIKO_BUS_TRACE
 		bool     is_wr = (b0 & 0x80) != 0;
 		uint32_t addr  = 0xB80000u | ((uint32_t)(b0 & 0x7F) << 1);
 		uint16_t data  = (uint16_t)b1 | ((uint16_t)b2 << 8);
 
 		akiko_diag("[trace] %s $%06X = 0x%04X", is_wr ? "W" : "R", addr, data);
+#else
+		(void)b0; (void)b1; (void)b2;
+#endif
 	}
 
 	DisableIO();
@@ -757,6 +961,63 @@ static void akiko_drain_trace(void)
 // -----------------------------------------------------------------------------
 // Top-level poll
 // -----------------------------------------------------------------------------
+
+// Phase 32.5.1 entrypoint: register the currently-mounted CD image's path
+// so we can pick the right per-game save slot. Called from
+// ide_cdrom.cpp::cdrom_parse on every mount/unmount. Empty string =
+// unmount. Safe to call before akiko_cd32_init() — state is plain static
+// memory and the actual SPI load is deferred to the poll loop.
+//
+// On a CD swap (different basename hash) we synchronously flush any dirty
+// EEPROM contents to the OLD save file before swapping, so `mount A → write
+// → mount B → write → mount A` preserves both saves correctly. The flush
+// is skipped when we never observed dirty for the old slot — that avoids
+// overwriting a real save with the synthesized FlashFile init from a
+// different CD when the player just browsed past one image without
+// running it.
+void akiko_cd32_set_cd_path(const char *path)
+{
+	char new_path[256] = {0};
+	if (path && *path) {
+		compute_save_path(path, new_path, sizeof(new_path));
+	}
+
+	if (strcmp(new_path, cd_save_path_active) == 0) {
+		// Same hash slot (or both empty) — nothing to do. Either the
+		// user remounted the same CD or this is a pre-init no-op.
+		return;
+	}
+
+	// Flush old save before swap, only if there's a chance writes happened
+	// since the last load (the dirty-debounce poll path may have already
+	// caught a write in flight; either way, dirty-observed gates this).
+	if (cd_save_path_active[0] && cd_save_dirty_observed) {
+		akiko_diag("[akiko] set_cd_path: flushing old save %s before swap",
+		           cd_save_path_active);
+		akiko_nvram_save_to_path(cd_save_path_active);
+	}
+
+	// Swap to the new slot.
+	strncpy(cd_save_path_active, new_path, sizeof(cd_save_path_active) - 1);
+	cd_save_path_active[sizeof(cd_save_path_active) - 1] = 0;
+	cd_save_dirty_observed = false;
+
+	if (!cd_save_path_active[0]) {
+		cd_save_load_pending = false;
+		akiko_diag("[akiko] set_cd_path: CD unmounted, no save file active");
+		return;
+	}
+
+	// Arm deferred load. The poll path's first-mounted handler will load
+	// the file into BRAM after the SPI_RST_USR pulse has finished wiping
+	// it but before BIOS issues its first EEPROM I2C read. Sync load from
+	// here is unsafe — it both gets wiped by the post-set_cd_path reset
+	// AND its 1024-byte spi_w stream perturbs bridge state in a way that
+	// breaks CF boot.
+	cd_save_load_pending = true;
+	akiko_diag("[akiko] set_cd_path: cd=%s -> save=%s (deferred load armed)",
+	           path, cd_save_path_active);
+}
 
 void akiko_cd32_init(void)
 {
@@ -773,6 +1034,19 @@ void akiko_cd32_init(void)
 	toc_point_count  = 0;
 	toc_push_idx     = -1;
 	toc_push_throttle = 0;
+
+	// Phase 32.5.1: a Minimig core reset wipes FPGA BRAM. If we already
+	// have an active per-game save file (set by cdrom_parse before or
+	// after this init), schedule a reload so soft `load_core` of Minimig
+	// behaves the same as a hardware reset for save persistence. Without
+	// this, the user sees "save vanished" after every core-reload loop.
+	cd_save_dirty_observed = false;
+	if (cd_save_path_active[0]) {
+		cd_save_load_pending = true;
+		akiko_diag("[akiko] init: scheduling reload of %s after BRAM wipe",
+		           cd_save_path_active);
+	}
+
 	akiko_dbg("init\n");
 }
 
@@ -792,20 +1066,63 @@ static void akiko_diag(const char *fmt, ...)
 
 void akiko_cd32_poll(void)
 {
+	// Phase 32.5 — REQUIRED throttle. Without this, the poll runs faster
+	// than the FPGA bridge can update its status word, and we see stale
+	// rx_busy/sec_req bits. CF then either pushes responses on top of
+	// each other or misses sec_req cycles, and stalls in a tight
+	// LED→PAUSE→PLAY loop reading lba 5-33 forever. Empirical: 200µs
+	// (~5000 polls/sec) reliably gets CF past the filesystem area into
+	// game data (lba 25k+); the heavier per-cmd akiko_dbg logging in
+	// pre-Phase-32.5 builds happened to add ~150µs/cmd which masked the
+	// problem. Don't remove without first proving the bridge can drive
+	// status updates at <200µs latency.
+	usleep(200);
+
 	bool mounted = cd_is_mounted();
 
 	// Heartbeat: prove poll loop reached us at all. Writes to a dedicated
 	// log file so it survives any stdout redirection MiSTer does after init.
+	// Phase 32.5.1: NVRAM load is no longer driven from here — it's
+	// scheduled by akiko_cd32_set_cd_path() (CD mount/swap) and
+	// akiko_cd32_init() (post-reconfig BRAM wipe), and serviced below
+	// once `mounted` is true. That way each Minimig load_core re-loads,
+	// not just hardware boots, and per-game saves work correctly.
 	static bool first_poll = true;
 	if (first_poll) {
 		first_poll = false;
 		akiko_diag("[akiko] poll alive (first call) mounted=%d", mounted);
 	}
 
-	// Drain bus trace ring first so we always log what the CPU did before
-	// we react to it. Cheap when the ring is empty (4 spi reads + early-out).
+	// Phase 32.5.1 deferred load. Triggered by set_cd_path() or init().
+	// Only fires once mounted=1 so we don't load before the CHD is open
+	// (early load would still work — it's purely a BRAM write — but the
+	// log line is more useful when correlated with the mount event).
+	if (cd_save_load_pending && mounted) {
+		cd_save_load_pending = false;
+		if (cd_save_path_active[0]) {
+			// One-shot legacy migration: if the per-game file doesn't
+			// exist but the legacy single-file save does, load the
+			// legacy data into the per-game slot for this CD. Useful
+			// for the user's existing cd32.nvr that pre-dates the
+			// per-game scheme.
+			struct stat pst;
+			if (stat(cd_save_path_active, &pst) != 0 &&
+			    stat(AKIKO_NVRAM_FILE_LEGACY, &pst) == 0 &&
+			    pst.st_size == AKIKO_NVRAM_BYTES) {
+				akiko_diag("[akiko] migrating legacy save %s -> %s",
+				           AKIKO_NVRAM_FILE_LEGACY, cd_save_path_active);
+				akiko_nvram_load_from_path(AKIKO_NVRAM_FILE_LEGACY);
+			} else {
+				akiko_nvram_load_from_path(cd_save_path_active);
+			}
+		}
+	}
+
+	// Always drain — the ring back-pressures the CPU when full. Per-entry
+	// logging is gated inside the function on AKIKO_BUS_TRACE.
 	akiko_drain_trace();
 
+#if AKIKO_CD32_DEBUG
 	// While we don't think we're mounted, periodically dump the underlying
 	// ide_inst flags so we can see what state the IDE subsystem is in.
 	// This burns one log line per second until something flips.
@@ -820,6 +1137,7 @@ void akiko_cd32_poll(void)
 			(void*)ide_inst[0].drive[1].chd_f, (void*)ide_inst[0].drive[1].f
 		);
 	}
+#endif
 
 	// Re-arm auto-init if media was swapped or just inserted.
 	if (mounted != cd_last_mounted) {
@@ -838,6 +1156,7 @@ void akiko_cd32_poll(void)
 	// overwrite it and lose data. Mirror of WinUAE's
 	// cdrom_can_return_data() gate.
 	uint16_t status = akiko_read_status();
+#if AKIKO_CD32_DEBUG
 	static uint16_t last_status = 0xffff;
 	static int status_log_count = 0;
 	if (status != last_status && status_log_count < 200) {
@@ -845,6 +1164,7 @@ void akiko_cd32_poll(void)
 		last_status = status;
 		status_log_count++;
 	}
+#endif
 	const bool rx_idle = !(status & AKIKO_STATUS_RX_BUSY);
 
 	// 1. Auto-init: WinUAE akiko.cpp:1388-1392 pushes a media-status frame
@@ -893,6 +1213,37 @@ void akiko_cd32_poll(void)
 		}
 	}
 
+	// Phase 32: NVRAM persistence. RTL latches nvr_dirty whenever BIOS
+	// writes a byte through the I2C path; userspace dumps + saves once
+	// the dirty state has held steady for the debounce window (BIOS
+	// FlashFile commits are bursty — 16+ writes back-to-back). Gate the
+	// dump itself on rx_idle so a save doesn't interleave with a queued
+	// MULTI response, but the timestamp tracking runs unconditionally.
+	{
+		static uint32_t nvr_dirty_seen_at = 0;     // 0 = not currently dirty
+		const bool nvr_dirty_now = (status & AKIKO_STATUS_NVR_DIRTY) != 0;
+		if (nvr_dirty_now) {
+			cd_save_dirty_observed = true;     // arms set_cd_path flush
+			uint32_t now_ms = (uint32_t)GetTimer(0);
+			if (!nvr_dirty_seen_at) {
+				nvr_dirty_seen_at = now_ms;
+				akiko_diag("[akiko] NVR dirty observed at t=%u", now_ms);
+			} else if (rx_idle &&
+			           (now_ms - nvr_dirty_seen_at) >= AKIKO_NVRAM_DIRTY_DEBOUNCE_MS) {
+				// Phase 32.5: bridge auto-clears dirty at end of the
+				// READ burst inside save_to_disk's nvram_dump, so no
+				// explicit clear-dirty SPI write is needed (and would
+				// in fact corrupt byte 0 under the new write-as-load
+				// bridge semantics).
+				akiko_nvram_save_to_disk();
+				nvr_dirty_seen_at = 0;
+			}
+		} else {
+			// Flag dropped (RTL reset, or we just cleared it). Re-arm.
+			nvr_dirty_seen_at = 0;
+		}
+	}
+
 	// Audio-play notification state machine (mirrors WinUAE akiko_handler,
 	// akiko.cpp:1411-1435). Only steps when the RX engine is idle so we
 	// never overwrite an in-flight reply with the play-state frame.
@@ -935,7 +1286,7 @@ void akiko_cd32_poll(void)
 		return;
 	}
 
-#ifdef AKIKO_CD32_DEBUG
+#if AKIKO_CD32_DEBUG
 	akiko_dbg("RX %d bytes:", n);
 	for (int i = 0; i < n; i++) printf(" %02x", cmd[i]);
 	printf("\n");
