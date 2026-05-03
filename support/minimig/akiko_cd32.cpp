@@ -181,6 +181,14 @@ static int32_t  cd_data_lba_base    = -1;
 //   -3   -> emit "play failed" (CDS_ERROR)
 static int8_t   cd_audio_timeout    = 0;
 
+// Phase 32.6 P4: wall-clock deadline for the natural play_ended notification.
+// Set when cmd_multi arms an audio play (start_lba/end_lba). When GetTimer(0)
+// passes this, the poll loop emits the "play ended" frame and clears
+// cd_playing. 0 = no audio play in progress. WinUAE's akiko_handler does this
+// off the actual audio renderer's frame counter; without real audio we rely
+// on track duration computed from the LBA range.
+static uint32_t cd_audio_play_until_ms = 0;
+
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
 
@@ -588,6 +596,7 @@ static void cmd_stop(const uint8_t *cmd)
 	// is a legitimate "engine just finished" signal and stays armed so BIOS
 	// sees the natural end-of-play frame.
 	if (cd_audio_timeout > 0) cd_audio_timeout = 0;
+	cd_audio_play_until_ms = 0;                  // P4: cancel pending natural end
 	akiko_send_response(r, 2);
 	akiko_dbg("STOP\n");
 }
@@ -699,6 +708,21 @@ static void cmd_multi(const uint8_t *cmd)
 		cd_paused = 0;
 		r[1] = 0x42;
 		cd_audio_timeout = 2;
+		// Phase 32.6 P4: schedule a wall-clock play_ended for actual track
+		// duration. CD audio is 75 frames/sec; (end_lba - start_lba) / 75
+		// gives seconds. Without this the poll loop never emits play_ended
+		// after the synchronous "play started", and games that gate
+		// progression on play_ended (anything CDDA-cued) wait forever.
+		// Cap at 1 hour so a misdecoded MSF doesn't strand state for ages.
+		if (e_lba > s_lba) {
+			uint32_t dur_ms = (e_lba - s_lba) * 1000u / 75u;
+			if (dur_ms > 3600u * 1000u) dur_ms = 3600u * 1000u;
+			cd_audio_play_until_ms = (uint32_t)GetTimer(0) + dur_ms;
+			akiko_diag("[akiko] PLAY AUDIO start=%u end=%u dur=%ums",
+			           s_lba, e_lba, dur_ms);
+		} else {
+			cd_audio_play_until_ms = 0;
+		}
 	}
 
 	akiko_send_response(r, 2);
@@ -1443,12 +1467,32 @@ void akiko_cd32_poll(void)
 			emit_playend_notify(1);
 			cd_playing = 0;
 			cd_audio_timeout = 0;
+			cd_audio_play_until_ms = 0;
 		} else if (cd_audio_timeout == -3) {
 			emit_playend_notify(-1);
 			cd_playing = 0;
 			cd_audio_timeout = 0;
+			cd_audio_play_until_ms = 0;
 		}
 		return;                              // one bridge action per poll
+	}
+
+	// Phase 32.6 P4: natural play_ended emission after the wall-clock track
+	// duration. cmd_multi audio branch arms cd_audio_play_until_ms; we fire
+	// the cdrom_playend_notify(1) frame once that deadline passes so games
+	// gating on "audio finished" advance correctly. Skipped while the
+	// existing cd_audio_timeout state machine is mid-transition (its
+	// negative-branch path already handles play_ended for explicit stops).
+	if (cd_audio_play_until_ms != 0 && cd_playing && rx_idle &&
+	    cd_audio_timeout == 0) {
+		uint32_t now_ms = (uint32_t)GetTimer(0);
+		if ((int32_t)(now_ms - cd_audio_play_until_ms) >= 0) {
+			emit_playend_notify(1);
+			cd_playing = 0;
+			cd_audio_play_until_ms = 0;
+			akiko_diag("[akiko] PLAY AUDIO natural end at t=%u", now_ms);
+			return;
+		}
 	}
 
 	if (status & AKIKO_STATUS_SEC_REQ) {
