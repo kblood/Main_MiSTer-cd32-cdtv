@@ -621,13 +621,22 @@ static void cmd_multi(const uint8_t *cmd)
 	cd_play_start_lba = s_lba;
 	cd_play_end_lba   = e_lba;
 
-	bool data_read = (cmd[7] & 0x80) != 0;
+	// cmd[7] bit 7 = standard data read. CF (and possibly other titles)
+	// also issues PLAYs with cmd[7] bit 6 set on game-data LBAs (start MSF
+	// well past pre-gap, end MSF = lead-out). WinUAE doesn't decode bit 6
+	// explicitly but observed CF behavior is: it still expects sector
+	// delivery via sec_req (we see counter=64 deliveries even with base
+	// supposedly cleared). Treat both bit 7 and bit 6 as "arm PBX for data
+	// read at start_lba". TODO: figure out the exact semantics — bit 6 may
+	// be a "no-stop" or "background read" flag.
+	bool data_read = (cmd[7] & 0xC0) != 0;
 	if (data_read) {
 		// M4: arm the PBX sector fetcher. cdrom_sector_counter on the FPGA
 		// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
 		// LBA = base + counter holds across the full read pass.
 		cd_data_lba_base = (int32_t)s_lba;
 		r[1] = 0x02;
+		akiko_diag("[akiko] PLAY DATA arm: start_lba=%u (cmd7=0x%02x)", s_lba, cmd[7]);
 	} else if (seek_negative) {
 		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
 		// Start streaming TOC entries to the BIOS one frame at a time.
@@ -1311,6 +1320,19 @@ void akiko_cd32_poll(void)
 			cmd_bad(cmd, CH_ERR_CHECKSUM);
 			return;
 		}
+	}
+
+	// Diagnostic cmd trace (low volume — skip the very chatty LED 0x05).
+	// Helps correlate sec_req with CF's command stream when debugging
+	// stuck-after-game-data-reached state.
+	if (op != 0x05) {
+		char hex[3 * AKIKO_CMD_MAX + 1];
+		int  off = 0;
+		for (int i = 0; i < n && i < 16; i++) {
+			off += snprintf(hex + off, sizeof(hex) - off, "%02x ", cmd[i]);
+		}
+		if (off > 0) hex[off - 1] = '\0';
+		akiko_diag("[akiko] CMD op=0x%02x n=%d bytes=%s", op, n, hex);
 	}
 
 	// 5. Dispatch.
