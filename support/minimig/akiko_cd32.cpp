@@ -83,13 +83,19 @@ static const int command_lengths[16] = {
 	1, 2, 1, 1, 12, 2, 1, 1, 4, 1, 2, -1, -1, -1, -1, -1
 };
 
-// Status / error nibbles (akiko.cpp). Place-holder values — we don't model
-// door open/close yet.
+// Status / error nibbles. Values are byte-exact mirrors of WinUAE
+// akiko.cpp:433-449 — getting these wrong is what kept the no-CD splash
+// from rendering: BIOS distinguishes "no disc, drive ready" (0xF8|door =
+// 0xF9) from "bad command" (0x80) by exact bit pattern. Returning 0x81
+// for no-disc (the wrong NODISK value 0x80 | door 0x01) made BIOS think
+// the drive was reporting an unknown command and re-poll forever.
 #define CH_ERR_OK          0x00
 #define CH_ERR_BADCOMMAND  0x80
-#define CH_ERR_NODISK      0x80
+#define CH_ERR_NODISK      0xf8
 #define CH_ERR_CHECKSUM    0x88
-#define CDS_PLAYING        0x80
+#define CDS_ERROR          0x80
+#define CDS_PLAYING        0x08
+#define CDS_PLAYEND        0x00
 
 // Drive firmware string returned by INFO (opcode 0x07). Exactly 18 chars,
 // matches akiko.cpp:176 #define FIRMWAREVERSION "CHINON  O-658-2 24".
@@ -172,13 +178,18 @@ static inline uint8_t bin_to_bcd(uint8_t v)
 	return (uint8_t)(((v / 10u) << 4) | (v % 10u));
 }
 
-// CD mounted? Use the first IDE port/drive that has a CD. ide.h shows
-// ide_inst[2].drive[2] with .present and .cd flags.
+// "Is real CD media inserted?" — matches WinUAE's `cdrom_disk != NULL` semantic.
+// A placeholder drive (cfg=2, no filename) has present=0/cd=1 with chd_f=NULL,
+// f=NULL — that's "drive ready, no media", which WinUAE treats as no-disk for
+// cmd_multi/pause/unpause. Checking present+cd alone would let MULTI fall into
+// the scan-TOC branch and then PLAY AUDIO with a junk seekpos, trapping BIOS
+// in the UNPAUSE polling loop and never letting it render the splash.
 static bool cd_is_mounted(void)
 {
 	for (int p = 0; p < 2; p++) {
 		for (int d = 0; d < 2; d++) {
-			if (ide_inst[p].drive[d].present && ide_inst[p].drive[d].cd) {
+			drive_t *drv = &ide_inst[p].drive[d];
+			if (drv->cd && (drv->chd_f || drv->f)) {
 				return true;
 			}
 		}
@@ -186,13 +197,14 @@ static bool cd_is_mounted(void)
 	return false;
 }
 
-// Find the first mounted CD drive (used by M4 sector fetch). NULL if none.
+// Find the first CD drive that has real media. NULL if no drive has media.
 static drive_t *cd_find_drive(void)
 {
 	for (int p = 0; p < 2; p++) {
 		for (int d = 0; d < 2; d++) {
-			if (ide_inst[p].drive[d].present && ide_inst[p].drive[d].cd) {
-				return &ide_inst[p].drive[d];
+			drive_t *drv = &ide_inst[p].drive[d];
+			if (drv->cd && (drv->chd_f || drv->f)) {
+				return drv;
 			}
 		}
 	}
@@ -440,26 +452,36 @@ static void cmd_stop(const uint8_t *cmd)
 	akiko_dbg("STOP\n");
 }
 
-// 0x02 — PAUSE.
+// 0x02 — PAUSE. WinUAE akiko.cpp:1005-1024. checkerr() at line 1014 returns
+// CH_ERR_NODISK | cdrom_door if no disc. We were returning 0 in that case,
+// telling BIOS "drive idle, fine" instead of "no disc, waiting for media".
 static void cmd_pause(const uint8_t *cmd)
 {
 	uint8_t r[2];
 	r[0] = cmd[0];
-	r[1] = cd_playing ? CDS_PLAYING : 0;
+	if (!cd_is_mounted()) {
+		r[1] = CH_ERR_NODISK | cd_door;
+	} else {
+		r[1] = (cd_playing ? CDS_PLAYING : 0) | cd_door;
+	}
 	cd_paused = 1;
 	akiko_send_response(r, 2);
-	akiko_dbg("PAUSE (playing=%d)\n", cd_playing);
+	akiko_dbg("PAUSE (playing=%d, mounted=%d)\n", cd_playing, cd_is_mounted());
 }
 
-// 0x03 — UNPAUSE.
+// 0x03 — UNPAUSE. WinUAE akiko.cpp:1027-1044. Same checkerr() pattern.
 static void cmd_unpause(const uint8_t *cmd)
 {
 	uint8_t r[2];
 	r[0] = cmd[0];
-	r[1] = cd_playing ? CDS_PLAYING : 0;
+	if (!cd_is_mounted()) {
+		r[1] = CH_ERR_NODISK | cd_door;
+	} else {
+		r[1] = (cd_playing ? CDS_PLAYING : 0) | cd_door;
+	}
 	cd_paused = 0;
 	akiko_send_response(r, 2);
-	akiko_dbg("UNPAUSE (playing=%d)\n", cd_playing);
+	akiko_dbg("UNPAUSE (playing=%d, mounted=%d)\n", cd_playing, cd_is_mounted());
 }
 
 // 0x04 — PLAY/READ. akiko.cpp:1257ff.
@@ -472,7 +494,7 @@ static void cmd_multi(const uint8_t *cmd)
 	r[0] = cmd[0];
 
 	if (!cd_is_mounted()) {
-		r[1] = 0x01;                         // "no disk" code in the play branch
+		r[1] = 0x01;                         // "no disk" code in the play branch (matches WinUAE akiko.cpp:1059)
 		akiko_send_response(r, 2);
 		akiko_dbg("PLAY: no disk\n");
 		return;
