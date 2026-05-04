@@ -1802,6 +1802,43 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	int drv = num & 1;
 	num >>= 1;
 
+	// Remember the last path mounted per (controller, drive) so we can
+	// short-circuit idempotent re-mounts. minimig_reset() → ApplyConfiguration
+	// → hdd_open → ide_open → cdrom_parse re-runs every in-core OSD reset,
+	// which previously closed and re-opened the CHD even when re-mounting the
+	// same file. That tear-down dropped the chd_file* parser, freed the
+	// hunkbuf (forcing a cold zlib re-decode of the first hunk on the next
+	// read), and lost the kernel readahead state for the open fd. The visible
+	// effect on CF: first MGL boot ~20s to intro, in-core reset ~40s+ with
+	// 50s sec_req gaps at lba=16 (PVD) and lba=11/12 (path table) — i.e.
+	// every disc-mount cold sector being re-read from cold CHD parser state.
+	// Holding the CHD open across reset preserves both the parser and (more
+	// importantly) the OS page cache for the file descriptor.
+	static char last_path[2][2][1024] = {};
+	const char *cmp_filename = filename ? filename : "";
+	bool same_path = filename && filename[0]
+	                 && !strcmp(last_path[num][drv], cmp_filename)
+	                 && ide_inst[num].drive[drv].chd_f != NULL;
+
+	if (same_path) {
+		// Idempotent re-mount: same CHD already open. Reset only the transient
+		// playback state and re-notify the Akiko bridge so per-game NVRAM
+		// stays correct. Skip cdrom_close_chd / track close / reload entirely.
+		// Caller (ide_open) passes our return value to ide_img_mount, which
+		// expects an absolute path — match the cold-load path's getFullPath
+		// behaviour rather than returning the relative input filename.
+		const char *full = getFullPath(filename);
+		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
+		if (_f) { fprintf(_f, "[ide_cdrom] cdrom_parse: idempotent re-mount of %s (full=%s) — keeping CHD open\n", filename, full); fclose(_f); }
+		ide_inst[num].drive[drv].mcr_flag = true;
+		ide_inst[num].drive[drv].playing = 0;
+		ide_inst[num].drive[drv].paused = 0;
+		ide_inst[num].drive[drv].play_start_lba = 0;
+		ide_inst[num].drive[drv].play_end_lba = 0;
+		akiko_cd32_set_cd_path(full);
+		return full;
+	}
+
 	//always close files and reset state. empty filename == unmounted cd from OSD
 	cdrom_close_chd(&ide_inst[num].drive[drv]);
 	for (uint8_t i = 0; i < sizeof(ide_inst[num].drive[drv].track) / sizeof(track_t); i++)
@@ -1832,6 +1869,16 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	// unmount or on failed load so the bridge clears its active slot.
 	// load_*_file return the image name on success, NULL on failure.
 	akiko_cd32_set_cd_path((path && res) ? path : "");
+
+	// Remember what we mounted so the next call can short-circuit if it's
+	// the same image (see top of function). Empty/failed mounts clear it
+	// so a re-attempt actually re-runs the load path.
+	if (filename && filename[0] && res) {
+		strncpy(last_path[num][drv], cmp_filename, sizeof(last_path[0][0]) - 1);
+		last_path[num][drv][sizeof(last_path[0][0]) - 1] = '\0';
+	} else {
+		last_path[num][drv][0] = '\0';
+	}
 
 	return res;
 }

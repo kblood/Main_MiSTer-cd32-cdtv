@@ -183,10 +183,14 @@ static uint32_t cd_play_end_lba     = 0;
 // (cmd[7] bit 7 = 1). On each FPGA sec_req, we read the FPGA's sector_counter
 // and fetch LBA = base + counter.
 //   -1                  = no data read armed (sec_req pushes zeros to keep PBX flowing)
-//   any other negative  = armed but start_msf was inside pre-gap (LBA underflowed).
-//                         WinUAE akiko.cpp:1308 early-returns without pushing in
-//                         this case; we mirror that — pushing zeros gave BIOS
-//                         garbage data instead of "no data ready".
+//   any other negative  = armed at a pre-gap start_msf (e.g. DotC arms at
+//                         start_lba=-34 to stream across pre-gap into track 1).
+//                         The per-sector push path silences sectors with
+//                         (base+counter) < 0 and serves CHD data once the
+//                         counter advances enough that the absolute LBA is
+//                         non-negative. Earlier code skipped the entire
+//                         burst on negative base, which stranded BIOSes
+//                         that depend on streaming across pre-gap.
 static int32_t  cd_data_lba_base    = -1;
 
 // PBX prefetch cache (mirrors WinUAE akiko.cpp:1589-1658). Without it, every
@@ -1434,14 +1438,6 @@ static void akiko_handle_sec_req(void)
 		akiko_push_sector(buf);
 		return;
 	}
-	if (cd_data_lba_base < 0) {
-		// Armed with pre-gap LBA. WinUAE skips the push so BIOS gets nothing
-		// rather than zero-filled garbage; mirror that. BIOS will re-arm with
-		// a valid LBA on the next MULTI.
-		akiko_dbg("sec_req with negative lba_base=%d (counter=%u) — skip push\n",
-		          cd_data_lba_base, counter);
-		return;
-	}
 
 	drive_t *drv = cd_find_drive();
 	if (!drv) {
@@ -1451,14 +1447,72 @@ static void akiko_handle_sec_req(void)
 		return;
 	}
 
-	uint32_t lba = (uint32_t)cd_data_lba_base + counter;
+	// Per-sector pre-gap check. Earlier code skipped the entire burst when
+	// cd_data_lba_base < 0, which broke DotC: its BIOS arms PLAY DATA at
+	// start_lba=-34 (typical CDTV/CD32 boot pattern of streaming across the
+	// pre-gap into track 1), then expects real sector data once the counter
+	// advances past 34. Per-burst skip stranded BIOS forever waiting on the
+	// first real sector. Per-sector handling silences only the genuinely-
+	// negative LBAs and serves CHD data once we cross zero.
+	int32_t signed_lba = cd_data_lba_base + (int32_t)counter;
+	if (signed_lba < 0) {
+		memset(buf, 0, sizeof(buf));
+		akiko_push_sector(buf);
+		return;
+	}
+	uint32_t lba = (uint32_t)signed_lba;
+
+	// Out-of-bounds guard. BIOS occasionally arms PLAY DATA past lead-out
+	// (CF arms start_lba=51216 with lead-out=39909, DotC has hit lba=286166
+	// against lead-out=115153). Without this guard, the prefetch refill fails,
+	// the cache marks the sector invalid, and we return rc=-2 forever — BIOS
+	// keeps re-asserting sec_req, we keep skip-pushing, the core hangs on a
+	// black screen. Push silence + advance so BIOS gets *something* and can
+	// move on, matching how WinUAE handles a read past the end of media.
+	//
+	// Defensive: when lead_out==0 (track table empty during a CHD swap window)
+	// we previously fell through to a guaranteed-failing CHD read and the
+	// ~5000Hz retry storm. Treat unknown geometry as "hold and silence" too —
+	// the bounded-retry path below catches the residual case where the OOB
+	// arm sneaks through with a stale-but-larger lead_out from a prior CHD.
+	int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+	uint32_t lead_out = (real_tracks > 0) ? drv->track[real_tracks].start : 0;
+	if (!lead_out || lba >= lead_out) {
+		static uint32_t last_oob_lba = 0;
+		if (lba != last_oob_lba) {
+			akiko_diag("[akiko] sec_req lba=%u %s lead_out=%u — push silence, advance",
+			           lba, lead_out ? ">=" : "(no track table)", lead_out);
+			last_oob_lba = lba;
+		}
+		memset(buf, 0, sizeof(buf));
+		akiko_push_sector(buf);
+		return;
+	}
+
 	int rc = akiko_prefetch_get(drv, lba, buf);
 	if (rc != 0) {
 		// rc == -1: the entire 128-sector batch read failed (CHD/SPI broken)
 		// rc == -2: this individual sector was marked invalid in the cache
-		// Either way, mirror WinUAE inc=0 — don't advance, BIOS retries.
-		akiko_diag("[akiko] sec_req lba=%u %s — skip push, retry", lba,
-		           (rc == -1) ? "prefetch FAIL" : "cached invalid");
+		// Bounded retry: WinUAE-style inc=0 hold lets BIOS retry on transients,
+		// but if the read keeps failing we'd otherwise spin at ~5000 Hz forever
+		// (observed: lba=51216 retry storms when the OOB guard misses because
+		// lead_out=0 during a CHD swap, and lba=543450 from junk PLAY DATA
+		// arms during core-load transitions). After MAX_FAIL_RETRIES on the
+		// same LBA, push silence + advance to unblock BIOS, matching how the
+		// OOB guard recovers.
+		static const unsigned MAX_FAIL_RETRIES = 8;
+		static uint32_t fail_lba = UINT32_MAX;
+		static unsigned fail_count = 0;
+		if (lba != fail_lba) { fail_lba = lba; fail_count = 0; }
+		fail_count++;
+		akiko_diag("[akiko] sec_req lba=%u %s (retry %u/%u)", lba,
+		           (rc == -1) ? "prefetch FAIL" : "cached invalid",
+		           fail_count, MAX_FAIL_RETRIES);
+		if (fail_count < MAX_FAIL_RETRIES) return;
+		akiko_diag("[akiko] sec_req lba=%u retry cap reached — push silence, advance", lba);
+		fail_lba = UINT32_MAX;
+		memset(buf, 0, sizeof(buf));
+		akiko_push_sector(buf);
 		return;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &ts2);
@@ -1624,6 +1678,15 @@ void akiko_cd32_init(void)
 	toc_point_count  = 0;
 	toc_push_idx     = -1;
 	toc_push_last_ms = 0;
+
+	// Cross-core data corruption guard: the 128-sector PBX prefetch buffer
+	// is plain static memory, so its contents survive load_core. Without
+	// invalidation, DotC asking for an LBA already cached from CF would
+	// receive CF's bytes. The post-info media-push pending flag is the
+	// same story — a stale "1" here would fire a spurious mediachange
+	// push on the very first poll of the new core.
+	akiko_prefetch_invalidate();
+	cd_post_info_media_push_pending = 0;
 
 	// Phase 32.5.1: a Minimig core reset wipes FPGA BRAM. If we already
 	// have an active per-game save file (set by cdrom_parse before or
