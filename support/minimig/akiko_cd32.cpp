@@ -23,12 +23,14 @@
 #include <errno.h>
 #include <unistd.h>       // unlink, fsync
 #include <time.h>         // clock_gettime for akiko_diag timestamp
+#include <byteswap.h>     // bswap_16 for CDDA big-endian → host conversion
 
 #include "../../spi.h"
 #include "../../user_io.h"
 #include "../../ide.h"
 #include "../../ide_cdrom.h"
 #include "../../hardware.h"   // GetTimer / CheckTimer
+#include "../chd/mister_chd.h" // mister_chd_read_sector for CDDA pump
 #include "akiko_cd32.h"
 
 // -----------------------------------------------------------------------------
@@ -66,6 +68,17 @@ static void akiko_diag(const char *fmt, ...);
 
 // Bridge address class (matches hps_ext.v:127 → akiko_cs).
 #define AKIKO_BRIDGE_ADDR  0xF400
+
+// CDDA audio FIFO sub-channel (Phase 33). hps_ext.v:148 selects cdda_cs on
+// io_din[15:9] == 7'b1111001 → 0xF200. Each UIO write byte is one half of
+// a 16-bit sample word; cdda.v internally pairs up consecutive 16-bit
+// writes into stereo frames {right,left} via its LRCK toggle.
+// FIFO depth backpressure surfaces in the status word as cdda_req (bit 8):
+// HIGH = FIFO has room for at least one full audio sector (cdda.v:79,
+// WRITE_REQ <= AVAILABLE_COUNT >= SECTOR_SIZE = 588 stereo samples).
+#define AKIKO_CDDA_ADDR        0xF200
+#define AKIKO_CDDA_BYTES       2352      // raw red-book audio frame
+#define AKIKO_STATUS_CDDA_REQ  (1u << 8) // hps_ext.v:167, cdda_req
 
 // Status-poll cmd byte. Returns one 16-bit word; bit[11] = akiko_req,
 // bit[10] = akiko_sec_req (M4 PBX wants a sector pushed).
@@ -168,8 +181,34 @@ static uint32_t cd_play_end_lba     = 0;
 
 // M4 PBX state: cd_data_lba_base is set when cmd 0x04 is issued in DATA mode
 // (cmd[7] bit 7 = 1). On each FPGA sec_req, we read the FPGA's sector_counter
-// and fetch LBA = base + counter. -1 = no data read in progress (push zeros).
+// and fetch LBA = base + counter.
+//   -1                  = no data read armed (sec_req pushes zeros to keep PBX flowing)
+//   any other negative  = armed but start_msf was inside pre-gap (LBA underflowed).
+//                         WinUAE akiko.cpp:1308 early-returns without pushing in
+//                         this case; we mirror that — pushing zeros gave BIOS
+//                         garbage data instead of "no data ready".
 static int32_t  cd_data_lba_base    = -1;
+
+// PBX prefetch cache (mirrors WinUAE akiko.cpp:1589-1658). Without it, every
+// sec_req is a fresh CHD seek + hunk decode (~600us+ per sector). With it, a
+// cache miss reads 128 sectors in a batch and subsequent reads in that window
+// are pure memcpy. cf_boot LBA-16 PVD region and the c_fodder executable
+// region (LBA 25655-25663) used to thrash the on-demand path; the cache
+// converts both into single batch reads.
+//
+// 128 * 2352 = 300 KB heap. Static allocation; no malloc.
+#define AKIKO_PREFETCH_SECTORS 128
+static int32_t cd_prefetch_base_lba = -1;        // first LBA in cache, -1 = empty
+static uint8_t cd_prefetch_buf[AKIKO_PREFETCH_SECTORS * AKIKO_SECTOR_BYTES];
+static uint8_t cd_prefetch_valid[AKIKO_PREFETCH_SECTORS];
+static uint32_t cd_prefetch_hits = 0;
+static uint32_t cd_prefetch_misses = 0;
+static uint32_t cd_prefetch_failed_sectors = 0;
+
+static inline void akiko_prefetch_invalidate(void)
+{
+	cd_prefetch_base_lba = -1;
+}
 
 // Audio-play notification state (mirror of WinUAE cdrom_audiotimeout,
 // akiko.cpp:1411-1435). cmd_multi acks PLAY AUDIO synchronously with 0x42
@@ -182,12 +221,25 @@ static int32_t  cd_data_lba_base    = -1;
 static int8_t   cd_audio_timeout    = 0;
 
 // Phase 32.6 P4: wall-clock deadline for the natural play_ended notification.
-// Set when cmd_multi arms an audio play (start_lba/end_lba). When GetTimer(0)
-// passes this, the poll loop emits the "play ended" frame and clears
-// cd_playing. 0 = no audio play in progress. WinUAE's akiko_handler does this
-// off the actual audio renderer's frame counter; without real audio we rely
-// on track duration computed from the LBA range.
+// Superseded by Phase 33's position-based pump (cd_cdda_lba_next/end) when a
+// CDDA pump is actually running — the pump fires playend_notify when it
+// finishes pushing the last sector. Kept as a safety net for failure paths
+// where the pump was never armed (e.g. cd_find_drive() returned NULL but the
+// caller has already advertised 0x42); 0 = inactive.
 static uint32_t cd_audio_play_until_ms = 0;
+
+// Phase 33 — CDDA streaming pump state.
+//   cd_cdda_lba_next : next absolute LBA to read from the CHD. -1 = idle.
+//   cd_cdda_lba_end  : exclusive end LBA (one past the last sector to push).
+//   cd_cdda_drv      : drive captured at PLAY-arm time. Held across the run
+//                      so a CD swap mid-play deterministically aborts when
+//                      the read fails rather than reading from the new disc.
+//                      NULL = idle.
+// All three are kept in lockstep — set together in cmd_multi and cleared
+// together in cmd_stop / pump natural-end / failure paths.
+static int32_t cd_cdda_lba_next = -1;
+static int32_t cd_cdda_lba_end  = -1;
+static drive_t *cd_cdda_drv     = NULL;
 
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
@@ -207,12 +259,12 @@ static uint8_t  cd_post_info_media_push_pending = 0;
 //   AKIKO_TOC_MAX_POINTS = 0xA0 + 0xA1 + 0xA2 + up to 99 tracks; cap at 16
 //   for our M5 use case (Cannon Fodder = 2 tracks → 5 points).
 #define AKIKO_TOC_REPEAT       3
-#define AKIKO_TOC_PUSH_PERIOD  1000 // ~70Hz at our ~70kHz poll = matches WinUAE framesync (60Hz)
+#define AKIKO_TOC_PUSH_PERIOD_MS 20 // 50 Hz, matches WinUAE PAL framesync (akiko.cpp:1438)
 #define AKIKO_TOC_MAX_POINTS   16
-static uint8_t toc_buffer[AKIKO_TOC_MAX_POINTS * 13];
-static uint8_t toc_point_count      = 0;
-static int16_t toc_push_idx         = -1;   // -1 = idle; else next slot in 3x sequence
-static int     toc_push_throttle    = 0;
+static uint8_t  toc_buffer[AKIKO_TOC_MAX_POINTS * 13];
+static uint8_t  toc_point_count     = 0;
+static int16_t  toc_push_idx        = -1;   // -1 = idle; else next slot in 3x sequence
+static uint32_t toc_push_last_ms    = 0;    // wall-clock ms of last push (Phase 33-B)
 
 // Phase 32.5.1: per-game NVRAM. cd_save_path_active is the full path of the
 // per-CD save file currently mirrored in FPGA BRAM (`""` when no CD is
@@ -492,7 +544,7 @@ static void akiko_build_toc(void)
 	// here (and in cmd_info) caused the drip to run forever, BIOS to consume
 	// 700k entries, and never frame LED=1/PLAY because it was stuck in TOC-
 	// scan mode. We keep the build (it's cheap) but leave toc_push_idx = -1.
-	toc_push_throttle = 0;
+	toc_push_last_ms = 0;
 	akiko_diag("[akiko] TOC built: %u points (%d real tracks, lead-out lba=%u)",
 	           toc_point_count, real_tracks, drv->track[real_tracks].start);
 }
@@ -591,6 +643,13 @@ static void cmd_stop(const uint8_t *cmd)
 	cd_playing = 0;
 	cd_paused = 0;
 	cd_data_lba_base = -1;                       // cancel any data-mode read
+	// Phase 33: tear down any in-flight CDDA pump. The FIFO will drain
+	// naturally over the next ~13 ms (588 stereo samples remaining at
+	// most). No need to flush — RTL just stops getting refills and the
+	// AUDIO_L/R outputs go to silence on FIFO empty.
+	cd_cdda_lba_next = -1;
+	cd_cdda_lba_end  = -1;
+	cd_cdda_drv      = NULL;
 	// If a play-started ack is still pending from a prior MULTI audio that
 	// just got STOPped, swallow it. Conversely, a play-ended timeout (-2/-1)
 	// is a legitimate "engine just finished" signal and stays armed so BIOS
@@ -636,11 +695,23 @@ static void cmd_unpause(const uint8_t *cmd)
 // 0x04 — PLAY/READ. akiko.cpp:1257ff.
 //   cmd[1..3] = start MSF (BCD), cmd[4..6] = end MSF (BCD).
 //   cmd[7] bit 7: 1 = data read, 0 = audio play.
+//   cmd[8] bit 6: 1 = 2x CD speed, 0 = 1x (WinUAE akiko.cpp:1055).
 // We *record* the LBAs but do not actually start audio/data — that's M4.
+// cdrom_speed is recorded for future seek-time simulation; we do not currently
+// throttle to the requested speed (we deliver faster than 2x already).
+static int cdrom_speed = 1;  // 1x or 2x; updated each cmd_multi
+
 static void cmd_multi(const uint8_t *cmd)
 {
 	uint8_t r[2];
 	r[0] = cmd[0];
+
+	int new_speed = (cmd[8] & 0x40) ? 2 : 1;
+	if (new_speed != cdrom_speed) {
+		akiko_diag("[akiko] cdrom_speed change %dx -> %dx (cmd8=0x%02x)",
+		           cdrom_speed, new_speed, cmd[8]);
+		cdrom_speed = new_speed;
+	}
 
 	if (!cd_is_mounted()) {
 		r[1] = 0x01;                         // "no disk" code in the play branch (matches WinUAE akiko.cpp:1059)
@@ -662,22 +733,20 @@ static void cmd_multi(const uint8_t *cmd)
 	cd_play_start_lba = s_lba;
 	cd_play_end_lba   = e_lba;
 
-	// cmd[7] bit 7 = standard data read. CF (and possibly other titles)
-	// also issues PLAYs with cmd[7] bit 6 set on game-data LBAs (start MSF
-	// well past pre-gap, end MSF = lead-out). WinUAE doesn't decode bit 6
-	// explicitly but observed CF behavior is: it still expects sector
-	// delivery via sec_req (we see counter=64 deliveries even with base
-	// supposedly cleared). Treat both bit 7 and bit 6 as "arm PBX for data
-	// read at start_lba". TODO: figure out the exact semantics — bit 6 may
-	// be a "no-stop" or "background read" flag.
-	bool data_read = (cmd[7] & 0xC0) != 0;
+	// cmd[7] bit 7 = data read. Match WinUAE akiko.cpp:1063 — bit 7 only.
+	// Earlier code also accepted bit 6 (0x40) as data_read on a speculative
+	// CF observation, but log analysis (63,728 PLAY DATA arms in CF boot)
+	// shows zero bit-6-only arms; CF always sets bit 7. Bit 6 is unspecified
+	// in the CD32 Akiko surface and accepting it as data_read would
+	// misclassify any future bit-6 use (likely a scan/seek flag).
+	bool data_read = (cmd[7] & 0x80) != 0;
 	if (data_read) {
 		// M4: arm the PBX sector fetcher. cdrom_sector_counter on the FPGA
 		// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
 		// LBA = base + counter holds across the full read pass.
 		cd_data_lba_base = (int32_t)s_lba;
 		r[1] = 0x02;
-		akiko_diag("[akiko] PLAY DATA arm: start_lba=%u (cmd7=0x%02x)", s_lba, cmd[7]);
+		akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x)", (int32_t)s_lba, cmd[7]);
 	} else if (seek_negative) {
 		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
 		// Start streaming TOC entries to the BIOS one frame at a time.
@@ -691,37 +760,73 @@ static void cmd_multi(const uint8_t *cmd)
 		cd_playing = 0;
 		cd_paused = 0;
 		toc_push_idx = (toc_point_count > 0) ? 0 : -1;
-		toc_push_throttle = 0;
+		toc_push_last_ms = 0;
 		r[1] = 0x00;                              // scan-TOC: no play-started flag
 		akiko_diag("[akiko] MULTI scan-TOC trigger (points=%u)", toc_point_count);
 	} else {
-		// PLAY AUDIO. Synchronous ack first (0x42 = "play starting"), then
-		// the poll loop emits the asynchronous "play started" follow-up via
-		// the cd_audio_timeout state machine. BIOS gates audio-cued game
+		// PLAY AUDIO. Synchronous ack (0x42 = "play starting") first; the
+		// poll loop emits the asynchronous "play started" follow-up via the
+		// cd_audio_timeout state machine. BIOS gates audio-cued game
 		// progress on the async frame — without it, titles that start a
-		// CDDA cue (Banshee, Speris Legacy, JP3) hang. Real audio output
-		// arrives in Phase 33 (CDDA streaming).
-		// TODO(Phase 33): replace with CDDA pump arming using
-		// cd_play_start_lba/cd_play_end_lba (already captured above).
+		// CDDA cue (Banshee, Speris Legacy, JP3) hang.
+		//
+		// Phase 33: arm the CDDA streaming pump. cd_cdda_lba_next/end and
+		// cd_cdda_drv form the pump's working set; the poll loop's
+		// akiko_cdda_pump() then pushes one sector per FIFO-ready tick and
+		// fires playend_notify(1) on natural end via cd_audio_timeout = -1.
 		cd_data_lba_base = -1;
 		cd_playing = 1;
 		cd_paused = 0;
 		r[1] = 0x42;
 		cd_audio_timeout = 2;
-		// Phase 32.6 P4: schedule a wall-clock play_ended for actual track
-		// duration. CD audio is 75 frames/sec; (end_lba - start_lba) / 75
-		// gives seconds. Without this the poll loop never emits play_ended
-		// after the synchronous "play started", and games that gate
-		// progression on play_ended (anything CDDA-cued) wait forever.
-		// Cap at 1 hour so a misdecoded MSF doesn't strand state for ages.
-		if (e_lba > s_lba) {
-			uint32_t dur_ms = (e_lba - s_lba) * 1000u / 75u;
-			if (dur_ms > 3600u * 1000u) dur_ms = 3600u * 1000u;
-			cd_audio_play_until_ms = (uint32_t)GetTimer(0) + dur_ms;
-			akiko_diag("[akiko] PLAY AUDIO start=%u end=%u dur=%ums",
-			           s_lba, e_lba, dur_ms);
-		} else {
+
+		// Validate: drive present, non-empty range, range falls inside an
+		// audio track (cd_read_audio_sector probes the track table on each
+		// read; we sanity-check the start LBA up front so an invalid PLAY
+		// fails synchronously via cdrom_audiotimeout = -3 → playend_notify
+		// (-1), matching WinUAE akiko.cpp:1432-1435).
+		drive_t *drv = cd_find_drive();
+		bool valid = false;
+		if (drv && e_lba > s_lba) {
+			// Probe the start LBA only; the rest of the range will be
+			// caught by the pump's per-sector validation. This is cheap
+			// (no SPI, just a read of the in-memory track table via the
+			// same logic cd_read_audio_sector uses).
+			int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+			for (int i = 0; i < real_tracks; i++) {
+				uint32_t end = drv->track[i].start + drv->track[i].length;
+				if (s_lba >= drv->track[i].start && s_lba < end) {
+					if (!(drv->track[i].attr & 0x40)) valid = true;
+					break;
+				}
+			}
+		}
+
+		if (valid) {
+			cd_cdda_drv      = drv;
+			cd_cdda_lba_next = (int32_t)s_lba;
+			cd_cdda_lba_end  = (int32_t)e_lba;
+			// Wall-clock fallback no longer needed — pump fires playend
+			// from natural-end detection on its own. Leave armed at 0.
 			cd_audio_play_until_ms = 0;
+			akiko_dbg("CDDA arm s=%u e=%u\n", s_lba, e_lba);
+			akiko_diag("[akiko] CDDA arm: s_lba=%u e_lba=%u (drv=%p)",
+			           s_lba, e_lba, (void*)drv);
+		} else {
+			// Bad range or wrong track type — schedule asynchronous
+			// failure notify. The synchronous 0x42 ack is already in r[]
+			// (sent below); the pump stays idle and the timeout walks
+			// 2 → 1 → emit "started", then we override with -3 below to
+			// also send the failure frame. Simpler: skip the "started"
+			// sequence entirely by going straight to -3.
+			cd_cdda_drv      = NULL;
+			cd_cdda_lba_next = -1;
+			cd_cdda_lba_end  = -1;
+			cd_audio_timeout = -3;
+			cd_audio_play_until_ms = 0;
+			cd_playing       = 0;
+			akiko_diag("[akiko] CDDA arm INVALID: drv=%p s_lba=%u e_lba=%u",
+			           (void*)drv, s_lba, e_lba);
 		}
 	}
 
@@ -783,10 +888,17 @@ static void cmd_subq(const uint8_t *cmd)
 			// Active data read: counter gives offset within the burst.
 			cur_lba = (uint32_t)cd_data_lba_base + akiko_read_sec_counter();
 			valid = true;
+		} else if (cd_playing && cd_cdda_lba_next > 0) {
+			// Audio play (Phase 33): pump tracks the next-to-push LBA.
+			// Report the position of the sector we *just* pushed
+			// (cd_cdda_lba_next - 1) so qcode advances frame-by-frame
+			// across the play range. WinUAE's qcode comes from the audio
+			// renderer's frame counter — same effect.
+			cur_lba = (uint32_t)(cd_cdda_lba_next - 1);
+			valid = true;
 		} else if (cd_playing && cd_play_start_lba > 0) {
-			// Audio play: we don't track elapsed frames yet, so report
-			// start position. WinUAE's qcode advances per-frame from
-			// the host audio thread; we'll wire that in P4.
+			// Pump idle but cd_playing still set (e.g. mid-pump-arm
+			// transition). Fall back to recorded start position.
 			cur_lba = cd_play_start_lba;
 			valid = true;
 		}
@@ -935,7 +1047,35 @@ static bool akiko_nvram_load_from_path(const char *path)
 	}
 	DisableIO();
 
-	akiko_diag("[akiko] NVR loaded %d bytes from %s", AKIKO_NVRAM_BYTES, path);
+	// Phase 33-A (2026-05-04): verify-pass — read back what we just wrote
+	// and compare to the file contents. If the BRAM port-B write side is
+	// silently no-op (Quartus M10K mis-inferred as SDP — see
+	// research/docs/winuae-nvram-analysis.md root cause #1), this readback
+	// will mismatch and we get an immediate diagnostic instead of a
+	// silent "save not persisting" bug surfacing only in CF later.
+	uint8_t verify[AKIKO_NVRAM_BYTES];
+	akiko_nvram_dump(verify);
+	int mismatches = 0;
+	int first_bad = -1;
+	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
+		if (verify[i] != buf[i]) {
+			if (first_bad < 0) first_bad = i;
+			mismatches++;
+		}
+	}
+	if (mismatches) {
+		// Phase 33-A: known-broken host_we write path (3 Quartus iterations
+		// in 2026-05-04 didn't fix it; deferred). See known-issues-deferred.md.
+		// We log a one-line summary and proceed — BIOS will recreate the
+		// FlashFile baseline from scratch on cold boot, so the load-from-disk
+		// failure is non-fatal but means saved game state is lost across boots.
+		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x). "
+		           "host_we path broken — saves not restored. See deferred issue.",
+		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
+	} else {
+		akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
+		           AKIKO_NVRAM_BYTES, path);
+	}
 	return true;
 }
 
@@ -1016,6 +1156,239 @@ static void akiko_push_sector(const uint8_t *buf)
 	DisableIO();
 }
 
+// -----------------------------------------------------------------------------
+// Phase 33 — CDDA streaming (UIO 0xF200, FIFO into rtl/cdda.v)
+// -----------------------------------------------------------------------------
+
+// Read one 2352-byte raw audio sector from the CHD into buf. Returns true on
+// success, false on any failure (no drive, no chd handle, LBA outside any
+// track, LBA inside a non-audio track, CHD read error). Failure leaves buf
+// untouched; the caller is expected to push silence.
+//
+// The CHD parser tags audio tracks with sector_size = 2352 and
+// attr & 0x40 == 0 (mister_chd.cpp:135-141). For audio sectors the CHD
+// stores the raw 2352 bytes verbatim (big-endian per 16-bit sample, the
+// canonical red-book layout). We fetch with mister_chd_read_sector using
+// the per-track chd_offset because CHD pads each track to 4-sector
+// boundaries — see ide_cdrom.cpp:1143 for the same pattern in the data
+// path. Re-implemented here rather than calling cdrom_read_raw_sector
+// because that helper (a) zero-fills audio tracks (attr != 0 path
+// at line 1865-1898 of ide_cdrom.cpp is for data) and (b) we want to
+// validate "is this actually audio" before reading.
+static bool cd_read_audio_sector(drive_t *drv, uint32_t lba, uint8_t *buf2352)
+{
+	if (!drv || !drv->chd_f || !buf2352) return false;
+
+	bool index0 = false;
+	track_t *track = NULL;
+	int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+	for (int i = 0; i < real_tracks; i++) {
+		uint32_t end = drv->track[i].start + drv->track[i].length;
+		if (lba >= drv->track[i].start && lba < end) {
+			track = &drv->track[i];
+			break;
+		}
+		// inside the index-0 pregap of the next track (lba < its start
+		// but covered by the previous track's data): we don't try to be
+		// clever for CDDA, just clamp to the owning track if any.
+		if (i + 1 < real_tracks && lba < drv->track[i + 1].start &&
+		    lba >= end) {
+			track = &drv->track[i];
+			index0 = true;
+			break;
+		}
+	}
+	(void)index0;
+
+	if (!track) return false;
+	// attr & 0x40 == 0 → audio (CDDA). Refuse to play data tracks as audio.
+	if (track->attr & 0x40) return false;
+	if (track->sectorSize != AKIKO_CDDA_BYTES) return false;
+
+	uint32_t chd_lba = lba + track->chd_offset;
+	if (mister_chd_read_sector(drv->chd_f, chd_lba, 0, 0,
+	                           AKIKO_CDDA_BYTES, buf2352,
+	                           drv->chd_hunkbuf, &drv->chd_hunknum)
+	    != CHDERR_NONE) {
+		return false;
+	}
+	return true;
+}
+
+// Read the bridge status word and check the cdda_req bit. HIGH means the
+// FIFO has room for at least one full sector and we can safely push 2352
+// bytes without backpressure stalls on the SPI side.
+static bool akiko_audio_fifo_ready(void)
+{
+	return (akiko_read_status() & AKIKO_STATUS_CDDA_REQ) != 0;
+}
+
+// Push 2352 bytes of raw audio to the CDDA FIFO via UIO_DMA_WRITE on the
+// cdda sub-channel (0xF200). 2352 bytes = 588 stereo frames × 2 channels
+// × 2 bytes/sample. CD audio is stored big-endian per 16-bit sample
+// (high byte first); after byte-swapping to host order each 16-bit value
+// is one channel sample.
+//
+// Bridge wiring (hps_ext.v:143, 229-235):
+//   cdda_dout <= io_din;           // 16-bit, full word from each spi_w
+//   cdda_wr   <= cdda_cs;          // pulses HIGH for one cycle per spi_w
+//                                  // when cmd == 0x61 and byte_cnt >= 3
+//
+// cdda.v then walks LRCK on each rising edge of WRITE (cdda_wr):
+//   - First spi_w  → DATA = DIN (left sample)
+//   - Second spi_w → BUFFER[WRITE_ADDR] = {DIN, DATA} = {right, left}
+//                    (AUDIO_L drives BUFFER_Q[15:0], AUDIO_R drives [31:16])
+//
+// So we send the LEFT sample as the first 16-bit word, then RIGHT, etc.
+// Each spi_w transmits the full 16-bit sample value (the FPGA's io_din is
+// 16 bits wide).
+static void akiko_push_audio_sector(const uint8_t *buf2352)
+{
+	const uint16_t *src = (const uint16_t *)buf2352;
+	const int nframes = AKIKO_CDDA_BYTES / 4;   // 588 stereo frames
+
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(AKIKO_CDDA_ADDR);
+	for (int i = 0; i < nframes; i++) {
+		uint16_t l = bswap_16(src[2 * i + 0]);  // CHD big-endian → host
+		uint16_t r = bswap_16(src[2 * i + 1]);
+		spi_w(l);                                // LRCK 0 → DATA = left
+		spi_w(r);                                // LRCK 1 → BUFFER = {right,left}
+	}
+	DisableIO();
+}
+
+// Pump tick: if a CDDA play is armed and the FIFO has room, push exactly
+// one sector. Returns true if it pushed (caller treats as one bridge
+// action consumed and returns from poll). Handles natural end-of-play
+// by emitting playend_notify(1) via the cd_audio_timeout state machine.
+static bool akiko_cdda_pump(void)
+{
+	if (cd_cdda_lba_next < 0) return false;
+	if (cd_paused) return false;
+	if (!cd_cdda_drv) {
+		// Drive vanished — abort the pump rather than spin trying to
+		// re-acquire (we'd risk reading from a swapped CD).
+		cd_cdda_lba_next = -1;
+		cd_cdda_lba_end  = -1;
+		cd_audio_timeout = -3;
+		akiko_diag("[akiko] CDDA pump abort: drive gone");
+		return false;
+	}
+	if (!akiko_audio_fifo_ready()) return false;
+
+	uint8_t buf[AKIKO_CDDA_BYTES];
+	uint32_t lba = (uint32_t)cd_cdda_lba_next;
+	if (!cd_read_audio_sector(cd_cdda_drv, lba, buf)) {
+		// Read failure — push silence so the FIFO doesn't underrun at the
+		// boundary, but tear down so we don't loop here forever. WinUAE
+		// emits playend_notify(-1) on producer error (akiko.cpp:1432-1435).
+		akiko_diag("[akiko] CDDA pump read FAIL at lba=%u, aborting", lba);
+		memset(buf, 0, sizeof(buf));
+		akiko_push_audio_sector(buf);
+		cd_cdda_lba_next = -1;
+		cd_cdda_lba_end  = -1;
+		cd_cdda_drv      = NULL;
+		cd_audio_timeout = -3;
+		return true;
+	}
+
+	akiko_push_audio_sector(buf);
+	cd_cdda_lba_next++;
+
+	if ((lba & 0xff) == 0) {
+		int32_t remaining = cd_cdda_lba_end - cd_cdda_lba_next;
+		(void)remaining;
+		akiko_dbg("CDDA pump pushed lba=%u (rem=%d)\n", lba, remaining);
+	}
+
+	if (cd_cdda_lba_next >= cd_cdda_lba_end) {
+		akiko_dbg("CDDA done at lba=%u\n", lba);
+		akiko_diag("[akiko] CDDA pump natural end at lba=%u", lba);
+		cd_cdda_lba_next = -1;
+		cd_cdda_lba_end  = -1;
+		cd_cdda_drv      = NULL;
+		// Advance the play-state machine through -1 → -2 → emit
+		// playend_notify(1). cd_audio_play_until_ms wall-clock fallback
+		// is no longer needed since we just hit natural end.
+		cd_audio_play_until_ms = 0;
+		cd_audio_timeout = -1;
+	}
+	return true;
+}
+
+// Refill the prefetch cache starting at base_lba. Reads up to
+// AKIKO_PREFETCH_SECTORS sectors; per-sector failures mark that slot invalid.
+// Returns number of sectors successfully read; 0 means the entire batch failed.
+//
+// Validity is binary (1=valid, 0=read-failed). WinUAE uses a decay counter
+// (init=3, decrement on access) as part of its multi-buffer eviction policy,
+// but since we have a single buffer with on-demand refill, decay would
+// silently break BIOS retry patterns: after 3 accesses to the same LBA the
+// entry would go invalid and stall the read. Keep validity binary instead.
+static int akiko_prefetch_fill(drive_t *drv, uint32_t base_lba)
+{
+	cd_prefetch_base_lba = (int32_t)base_lba;
+	int filled = 0;
+	for (int i = 0; i < AKIKO_PREFETCH_SECTORS; i++) {
+		uint32_t lba = base_lba + i;
+		uint8_t *slot = &cd_prefetch_buf[i * AKIKO_SECTOR_BYTES];
+		if (cdrom_read_raw_sector(drv, lba, slot) == 0) {
+			cd_prefetch_valid[i] = 1;
+			filled++;
+		} else {
+			cd_prefetch_valid[i] = 0;
+			cd_prefetch_failed_sectors++;
+		}
+	}
+	return filled;
+}
+
+// Returns 0 on cache hit (buf populated), -1 on miss-and-refill-failed, or
+// -2 on cached-as-bad. -2 = sector failed to read; caller should skip the PBX
+// push so the FPGA holds sec_req and BIOS retries on the next poll.
+//
+// On miss, if the requested LBA isn't at a 128-sector boundary, retry-reads
+// of just-evicted sectors would be punished. To stay friendly to short
+// backwards seeks (BIOS often re-reads PVD/dirent after data passes), align
+// the fill base to a 128-sector boundary so the cache window is predictable.
+static int akiko_prefetch_get(drive_t *drv, uint32_t lba, uint8_t *out_buf)
+{
+	bool in_window = (cd_prefetch_base_lba >= 0
+	                  && lba >= (uint32_t)cd_prefetch_base_lba
+	                  && lba <  (uint32_t)cd_prefetch_base_lba + AKIKO_PREFETCH_SECTORS);
+	if (!in_window) {
+		cd_prefetch_misses++;
+		uint32_t base = (lba / AKIKO_PREFETCH_SECTORS) * AKIKO_PREFETCH_SECTORS;
+		if (akiko_prefetch_fill(drv, base) == 0) {
+			akiko_diag("[akiko] prefetch fill TOTAL FAIL at base=%u (req lba=%u)",
+			           base, lba);
+			return -1;
+		}
+		akiko_diag("[akiko] prefetch refill base=%u (req lba=%u hits=%u misses=%u failed=%u)",
+		           base, lba, cd_prefetch_hits, cd_prefetch_misses,
+		           cd_prefetch_failed_sectors);
+	} else {
+		cd_prefetch_hits++;
+	}
+	int idx = (int)(lba - (uint32_t)cd_prefetch_base_lba);
+	if (cd_prefetch_valid[idx] == 0) {
+		// In-window but flagged bad. Try a single-sector re-read for this
+		// LBA only — transient CHD errors shouldn't permanently poison the
+		// cache slot.
+		uint8_t *slot = &cd_prefetch_buf[idx * AKIKO_SECTOR_BYTES];
+		if (cdrom_read_raw_sector(drv, lba, slot) == 0) {
+			cd_prefetch_valid[idx] = 1;
+		} else {
+			return -2;
+		}
+	}
+	memcpy(out_buf, &cd_prefetch_buf[idx * AKIKO_SECTOR_BYTES],
+	       AKIKO_SECTOR_BYTES);
+	return 0;
+}
+
 // Service one akiko_sec_req. Reads the engine's current sector_counter,
 // fetches LBA = base + counter from the CD image, and pushes the raw 2352-byte
 // frame back. On any error (no disc, no data read armed, image read failure)
@@ -1036,16 +1409,37 @@ static void akiko_handle_sec_req(void)
 	static uint32_t bucket_count = 0;
 	const uint32_t BUCKET_SIZE = 256;
 
+	// Phase 33-C diagnostic: log sec_req gap > 50 ms with the lba context.
+	// If sec_req keeps firing during the BIOS "stall", bottleneck is elsewhere
+	// (CHD read or push). If sec_req goes silent, BIOS has stopped writing
+	// cdrom_pbx and the gap is BIOS-internal — pointing at a missing
+	// completion notification on our side.
+	static uint32_t last_sec_req_ms = 0;
+	uint32_t now_ms = (uint32_t)GetTimer(0);
+	if (last_sec_req_ms != 0 && (now_ms - last_sec_req_ms) >= 50) {
+		akiko_diag("[akiko] sec_req GAP %ums (lba_base=%d)",
+		           now_ms - last_sec_req_ms, cd_data_lba_base);
+	}
+	last_sec_req_ms = now_ms;
+
 	clock_gettime(CLOCK_MONOTONIC, &ts0);
 	uint8_t counter = akiko_read_sec_counter();
 	clock_gettime(CLOCK_MONOTONIC, &ts1);
 
 	uint8_t buf[AKIKO_SECTOR_BYTES];
 
-	if (cd_data_lba_base < 0) {
+	if (cd_data_lba_base == -1) {
 		akiko_dbg("sec_req but no data read armed (counter=%u)\n", counter);
 		memset(buf, 0, sizeof(buf));
 		akiko_push_sector(buf);
+		return;
+	}
+	if (cd_data_lba_base < 0) {
+		// Armed with pre-gap LBA. WinUAE skips the push so BIOS gets nothing
+		// rather than zero-filled garbage; mirror that. BIOS will re-arm with
+		// a valid LBA on the next MULTI.
+		akiko_dbg("sec_req with negative lba_base=%d (counter=%u) — skip push\n",
+		          cd_data_lba_base, counter);
 		return;
 	}
 
@@ -1058,9 +1452,14 @@ static void akiko_handle_sec_req(void)
 	}
 
 	uint32_t lba = (uint32_t)cd_data_lba_base + counter;
-	if (cdrom_read_raw_sector(drv, lba, buf) != 0) {
-		akiko_dbg("sec_req lba=%u read FAILED\n", lba);
-		memset(buf, 0, sizeof(buf));
+	int rc = akiko_prefetch_get(drv, lba, buf);
+	if (rc != 0) {
+		// rc == -1: the entire 128-sector batch read failed (CHD/SPI broken)
+		// rc == -2: this individual sector was marked invalid in the cache
+		// Either way, mirror WinUAE inc=0 — don't advance, BIOS retries.
+		akiko_diag("[akiko] sec_req lba=%u %s — skip push, retry", lba,
+		           (rc == -1) ? "prefetch FAIL" : "cached invalid");
+		return;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &ts2);
 
@@ -1121,12 +1520,22 @@ static void akiko_drain_trace(void)
 
 		if (b3 == 0) break;              // ring drained
 
+		// Phase 33-C: filtered trace — log only writes to control registers
+		// ($00-$27) so we can see CDFLAG_ENABLE toggles, PBX writes, INTREQ
+		// acks during the sec_req stall. Excludes high-volume cmd buffer
+		// ($18-$1B) and data-DMA addresses to keep log overhead manageable.
+		// Set AKIKO_BUS_TRACE=1 to also see filtered reads.
+		uint8_t  reg_addr = (b0 & 0x7F) << 1;          // word address within $B80000
+		bool     is_wr    = (b0 & 0x80) != 0;
+		bool     is_ctrl  = (reg_addr <= 0x27);        // control registers
+		bool     is_cmd_buf = (reg_addr >= 0x18 && reg_addr <= 0x1B); // very chatty
+		if (is_wr && is_ctrl && !is_cmd_buf) {
+			uint32_t addr = 0xB80000u | reg_addr;
+			uint16_t data = (uint16_t)b1 | ((uint16_t)b2 << 8);
+			akiko_diag("[trace] W $%06X = 0x%04X", addr, data);
+		}
 #if AKIKO_BUS_TRACE
-		bool     is_wr = (b0 & 0x80) != 0;
-		uint32_t addr  = 0xB80000u | ((uint32_t)(b0 & 0x7F) << 1);
-		uint16_t data  = (uint16_t)b1 | ((uint16_t)b2 << 8);
-
-		akiko_diag("[trace] %s $%06X = 0x%04X", is_wr ? "W" : "R", addr, data);
+		(void)0; // (full trace already covered above for writes)
 #else
 		(void)b0; (void)b1; (void)b2;
 #endif
@@ -1207,10 +1616,14 @@ void akiko_cd32_init(void)
 	cd_play_end_lba   = 0;
 	cd_data_lba_base = -1;
 	cd_audio_timeout = 0;
+	cd_audio_play_until_ms = 0;
+	cd_cdda_lba_next = -1;
+	cd_cdda_lba_end  = -1;
+	cd_cdda_drv      = NULL;
 	cd_last_mounted  = false;
 	toc_point_count  = 0;
 	toc_push_idx     = -1;
-	toc_push_throttle = 0;
+	toc_push_last_ms = 0;
 
 	// Phase 32.5.1: a Minimig core reset wipes FPGA BRAM. If we already
 	// have an active per-game save file (set by cdrom_parse before or
@@ -1317,29 +1730,60 @@ void akiko_cd32_poll(void)
 	}
 #endif
 
-	// Re-arm auto-init if media was swapped or just inserted. Phase 32.6:
-	// also queue a media-absent push (0x0a/0x00) on mount->unmount so the
-	// CD32 BIOS sees the eject and falls back to "no disc" — without this
-	// the BIOS holds onto its last-mounted media state forever and never
-	// re-detects when a new CD is inserted via OSD. Mirror of WinUAE
-	// akiko.cpp:1399-1407 (mediachanged push).
+	// Mediachange handling. Mirror WinUAE akiko.cpp:1399-1408: insert AFTER
+	// INFO has run (cd_initialized>=2) goes through the dedicated mediachange
+	// path that pushes 0x0a/0x01 + rebuilds TOC WITHOUT regressing FSM state.
+	// Insert BEFORE INFO (cd_initialized<2, e.g. cold boot with CD) goes
+	// through the cold-boot auto-init path below. Eject queues a 0x0a/0x00
+	// push so BIOS sees the disc has gone away.
+	//
+	// Phase 33-D (2026-05-04): the prior version reset cd_initialized=0 on
+	// EVERY mount edge, which broke the boot-with-no-CD-then-mount scenario:
+	// BIOS issues INFO during no-CD state (cd_initialized -> 2), mount drops
+	// it to 0, auto-init bumps it to 1, but BIOS never re-issues INFO so we
+	// never reach 2 again — TOC drip (gated on cd_initialized==2) stays dead
+	// and BIOS sits on no-disc screen forever. WinUAE keeps cd_initialized=2
+	// across mediachange and the mediachange push alone is enough.
 	static bool media_absent_push_pending = false;
+	static bool mediachanged_push_pending = false;
 	if (mounted != cd_last_mounted) {
-		cd_initialized   = 0;
 		cd_data_lba_base = -1;               // any in-progress read is stale
-		toc_point_count  = 0;                // force TOC rebuild after next INFO
+		akiko_prefetch_invalidate();         // cache may be from previous disc
+		// Phase 33: a CD swap or eject must abort any in-flight CDDA
+		// pump — the captured cd_cdda_drv pointer would now reference a
+		// closed CHD or read from the new disc otherwise.
+		cd_cdda_lba_next = -1;
+		cd_cdda_lba_end  = -1;
+		cd_cdda_drv      = NULL;
+		toc_point_count  = 0;
 		toc_push_idx     = -1;
 		if (!mounted) {
 			// Just ejected — arm the absent push (gated on rx_idle below).
+			// Preserve cd_initialized so the next insert routes through the
+			// mediachange path (matches WinUAE: cd_initialized only resets
+			// in akiko_reset, never on mediachange).
 			media_absent_push_pending = true;
+			mediachanged_push_pending = false;
 		} else {
-			// Just inserted — auto-init below will re-fire 0x0a/0x01;
-			// any pending absent push is moot.
+			// Just inserted. Rebuild TOC eagerly so it's fresh when BIOS
+			// queries (mirror WinUAE get_cdrom_toc() in mediachange branch
+			// at akiko.cpp:1403; WinUAE calls it twice — first try may fail,
+			// safe to do up front then again in the push branch below).
 			media_absent_push_pending = false;
+			akiko_build_toc();
+			if (cd_initialized >= 2) {
+				// Insert AFTER INFO has run — use mediachange path. Pushes
+				// 0x0a/0x01 without regressing cd_initialized so the TOC
+				// drip can fire when BIOS issues MULTI 0x04. This is the
+				// boot-with-no-CD-then-mount fix (was broken pre-Phase 33-D).
+				mediachanged_push_pending = true;
+			}
+			// Else (cd_initialized<2): cold-boot auto-init path will fire.
 		}
-		cd_last_mounted  = mounted;
-		akiko_diag("[akiko] media change -> mounted=%d (absent_push_pending=%d)",
-		           mounted, media_absent_push_pending);
+		cd_last_mounted = mounted;
+		akiko_diag("[akiko] media change -> mounted=%d cd_init=%u (absent=%d, mediachanged=%d)",
+		           mounted, cd_initialized,
+		           media_absent_push_pending, mediachanged_push_pending);
 	}
 
 	// 0. Status poll moved up so unsolicited pushes (auto-init, post-INFO,
@@ -1376,6 +1820,20 @@ void akiko_cd32_poll(void)
 		akiko_diag("[akiko] auto-init media-status push: opcode=0x0a status=0x01 (cd_initialized=1)");
 	}
 
+	// Phase 33-D: mediachange push. Fired on insert AFTER INFO has run
+	// (cd_initialized>=2). Mirror of WinUAE akiko.cpp:1399-1408 — pushes
+	// 0x0a/0x01 + rebuilds TOC twice, WITHOUT resetting cd_initialized so
+	// the TOC drip can fire when BIOS responds with MULTI 0x04.
+	if (mediachanged_push_pending && mounted && cd_initialized >= 2 && rx_idle) {
+		uint8_t r[2];
+		r[0] = 0x0a;
+		r[1] = 0x01;
+		akiko_send_response(r, 2);
+		mediachanged_push_pending = false;
+		akiko_build_toc();                                  // WinUAE: "do not remove! first try may fail"
+		akiko_diag("[akiko] mediachange push: opcode=0x0a status=0x01 (TOC rebuilt 2x)");
+	}
+
 	// Phase 32.6: pending eject notification. Fired once per mount->unmount
 	// edge; cleared on send. rx_idle gating same as auto-init.
 	if (media_absent_push_pending && !mounted && rx_idle) {
@@ -1406,13 +1864,17 @@ void akiko_cd32_poll(void)
 	// (akiko.cpp:1438-1440). Throttle accumulates only when the engine is
 	// idle — pushing into a busy buffer would silently drop the entry.
 	if (cd_initialized == 2 && toc_push_idx >= 0 && rx_idle) {
-		// Throttle: WinUAE pushes one TOC entry per video frame (~50 Hz).
-		// Phase 19.6: prior /20 throttle bursted all 15 frames in ~1s
-		// (Phase 18 measured ~60 kHz effective poll rate). /1200 brings
-		// us roughly back to 50 Hz and gives BIOS time to process each
-		// frame's RXDMADONE before the next overwrite.
-		if (++toc_push_throttle >= 1200) {
-			toc_push_throttle = 0;
+		// Phase 33-B (2026-05-04): wall-clock 50 Hz pacing — matches
+		// WinUAE's framesync-driven cdrom_return_toc_entry()
+		// (akiko.cpp:1438-1440, ~50 Hz PAL). Prior /1200 poll-count
+		// throttle assumed a ~60 kHz poll rate but the real rate under
+		// load is ~6.8 kHz, giving 175 ms/frame and (because the drip-
+		// complete detection requires the same throttle to elapse one
+		// more time after the last push) a measured 52-second stall
+		// before BIOS resumed. Wall-clock pacing is rate-independent.
+		uint32_t now_ms = (uint32_t)GetTimer(0);
+		if ((now_ms - toc_push_last_ms) >= AKIKO_TOC_PUSH_PERIOD_MS) {
+			toc_push_last_ms = now_ms;
 			akiko_push_toc_entry();
 		}
 	}
@@ -1495,6 +1957,18 @@ void akiko_cd32_poll(void)
 		}
 	}
 
+	// Phase 33: CDDA pump. Push exactly one audio sector per poll if the
+	// FIFO has room (status bit 8 = cdda_req asserted). The pump writes to
+	// the cdda sub-channel (0xF200) which is independent of the bridge's
+	// RX engine, so no rx_idle gate is needed. Runs even when paused (it
+	// will see cd_paused=1 and decline) so the FIFO keeps draining naturally
+	// during a pause; resuming starts pushing again from cd_cdda_lba_next.
+	// On natural end, the pump arms cd_audio_timeout=-1 so the existing
+	// state machine emits playend_notify(1) on a subsequent poll.
+	if (akiko_cdda_pump()) {
+		return;                              // one bridge action per poll
+	}
+
 	if (status & AKIKO_STATUS_SEC_REQ) {
 		akiko_handle_sec_req();
 		return;                              // one bridge action per poll
@@ -1552,6 +2026,20 @@ void akiko_cd32_poll(void)
 
 	// 5. Dispatch.
 	switch (op) {
+		case 0x00: {
+			// Phase 33-A WinUAE-parity: NOP / echo (akiko.cpp:1259-1262).
+			// WinUAE returns a 1-byte response equal to the opcode itself
+			// (the leading nibble is 0x0 — the responding side overwrites
+			// it during framing). We previously fell through to cmd_bad
+			// here which sent a 2-byte CH_ERR_BADCOMMAND, which BIOS may
+			// have misinterpreted as a real error frame for the previous
+			// command.
+			uint8_t r[1];
+			r[0] = cmd[0];
+			akiko_send_response(r, 1);
+			akiko_dbg("CMD 0x00 echo\n");
+			break;
+		}
 		case 0x01: cmd_stop(cmd);    break;
 		case 0x02: cmd_pause(cmd);   break;
 		case 0x03: cmd_unpause(cmd); break;
@@ -1559,6 +2047,18 @@ void akiko_cd32_poll(void)
 		case 0x05: cmd_led(cmd);     break;
 		case 0x06: cmd_subq(cmd);    break;
 		case 0x07: cmd_info(cmd);    break;
+		case 0x08:
+		case 0x09:
+		case 0x0a:
+			// WinUAE-parity (akiko.cpp:1284-1290): these opcodes have
+			// valid frame lengths in command_lengths[] (4, 1, 2) so the
+			// framer consumes them, but the dispatcher returns len=0 and
+			// sends no response payload. Previously we fell through to
+			// cmd_bad which emitted a CH_ERR_BADCOMMAND frame — wrong vs
+			// WinUAE and could confuse BIOS into treating a legitimately-
+			// silent command as a bad-command error for the prior op.
+			akiko_dbg("CMD 0x%02x consumed (no response per WinUAE parity)\n", op);
+			break;
 		default:
 			cmd_bad(cmd, CH_ERR_BADCOMMAND);
 			break;
