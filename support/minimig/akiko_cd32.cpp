@@ -283,6 +283,16 @@ static char cd_save_path_active[256] = {0};
 static bool cd_save_load_pending     = false;
 static bool cd_save_dirty_observed   = false;
 
+// Per-slot guard: set true when akiko_nvram_load_from_path's verify pass
+// fails for cd_save_path_active. Cleared when set_cd_path swaps to a new
+// slot, or when init() runs and the load is re-armed. While set,
+// akiko_nvram_save_to_disk refuses to overwrite the on-disk file — BRAM
+// is not a faithful mirror of disk after a failed load (BIOS will see
+// the .mif baseline and "rebuild" the FlashFile bootstrap, which our
+// dirty-detect would otherwise capture and persist over the user's real
+// save). See known-issues-deferred.md "NVRAM disk persistence" section.
+static bool cd_save_load_failed      = false;
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
@@ -1076,9 +1086,15 @@ static bool akiko_nvram_load_from_path(const char *path)
 		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x). "
 		           "host_we path broken — saves not restored. See deferred issue.",
 		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
+		// Block writeback for this slot — BRAM contents are now the .mif
+		// baseline, not the disk file. If we let dirty-detect persist what
+		// BIOS does next, we'll silently overwrite the user's real save
+		// with the synthesized FlashFile bootstrap (observed 2026-05-04).
+		cd_save_load_failed = true;
 	} else {
 		akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
 		           AKIKO_NVRAM_BYTES, path);
+		cd_save_load_failed = false;
 	}
 	return true;
 }
@@ -1088,10 +1104,30 @@ static bool akiko_nvram_load_from_path(const char *path)
 // akiko_diag and leave the dirty flag set (next poll re-tries). Note that
 // akiko_nvram_dump on the bridge auto-clears the dirty flag at end of the
 // read burst, so a successful save is naturally idempotent.
+//
+// Idempotent-write guard: if the dump matches the file already on disk
+// byte-for-byte, skip the rewrite. BIOS often re-writes the same value
+// (e.g. an entry-accessed flag that was already set), and we don't want
+// to churn the SD card or update mtime for a no-op change.
 static bool akiko_nvram_save_to_path(const char *path)
 {
 	uint8_t buf[AKIKO_NVRAM_BYTES];
 	akiko_nvram_dump(buf);
+
+	// Idempotent-write guard. Read current file (if any) and compare.
+	{
+		FILE *cur = fopen(path, "rb");
+		if (cur) {
+			uint8_t disk_buf[AKIKO_NVRAM_BYTES];
+			size_t n = fread(disk_buf, 1, AKIKO_NVRAM_BYTES, cur);
+			fclose(cur);
+			if (n == AKIKO_NVRAM_BYTES &&
+			    memcmp(disk_buf, buf, AKIKO_NVRAM_BYTES) == 0) {
+				akiko_diag("[akiko] NVR save skipped: identical to %s", path);
+				return true;
+			}
+		}
+	}
 
 	// Ensure target directory exists. mkdir is fine if it already does
 	// (EEXIST). Other errors surface during fopen.
@@ -1134,8 +1170,26 @@ static bool akiko_nvram_save_to_path(const char *path)
 // per-game save filename if a CD path is active; otherwise falls back to
 // the legacy single-file slot so writes that happen with no CD context
 // (shouldn't normally occur, but cheap insurance) aren't silently dropped.
+//
+// Load-failure guard: if the most recent load_from_path verify failed for
+// this slot, BRAM is the .mif baseline rather than a faithful mirror of
+// disk. Any BIOS write into that baseline is BIOS recreating its
+// FlashFile bootstrap, NOT a real user save — persisting it would silently
+// overwrite the user's real on-disk save with the empty bootstrap
+// (observed 2026-05-04, confirmed via byte diff against pre-reset save).
+// Refuse the write until set_cd_path or init re-arms the load.
 static bool akiko_nvram_save_to_disk(void)
 {
+	if (cd_save_load_failed && cd_save_path_active[0]) {
+		static bool warned_once = false;
+		if (!warned_once) {
+			akiko_diag("[akiko] NVR save BLOCKED: load failed for %s — refusing to "
+			           "overwrite real save with BIOS bootstrap. Future blocks silent.",
+			           cd_save_path_active);
+			warned_once = true;
+		}
+		return false;
+	}
 	const char *target = (cd_save_path_active[0])
 		? cd_save_path_active
 		: AKIKO_NVRAM_FILE_LEGACY;
@@ -1641,6 +1695,10 @@ void akiko_cd32_set_cd_path(const char *path)
 	strncpy(cd_save_path_active, new_path, sizeof(cd_save_path_active) - 1);
 	cd_save_path_active[sizeof(cd_save_path_active) - 1] = 0;
 	cd_save_dirty_observed = false;
+	// Reset load-failed status — the new slot will set it from its own
+	// load_from_path verify result. Without this, a previous slot's failure
+	// would block writeback for the new slot too.
+	cd_save_load_failed = false;
 
 	if (!cd_save_path_active[0]) {
 		cd_save_load_pending = false;
@@ -1694,6 +1752,11 @@ void akiko_cd32_init(void)
 	// behaves the same as a hardware reset for save persistence. Without
 	// this, the user sees "save vanished" after every core-reload loop.
 	cd_save_dirty_observed = false;
+	// The pending load might succeed this time (host_we Quartus issue is
+	// nondeterministic across power cycles per past observations); clear
+	// the failed flag so a successful load isn't blocked, and a failed
+	// load can re-set it.
+	cd_save_load_failed = false;
 	if (cd_save_path_active[0]) {
 		cd_save_load_pending = true;
 		akiko_diag("[akiko] init: scheduling reload of %s after BRAM wipe",
