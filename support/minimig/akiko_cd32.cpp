@@ -1027,16 +1027,73 @@ static void akiko_nvram_dump(uint8_t *out_1024)
 	DisableIO();
 }
 
-// Load 1024 bytes from a save file into FPGA NVRAM BRAM. The actual
-// transport will be wired in the next commit (canonical
-// hps_io.ioctl_download path → akiko_nvram.load_we BRAM write port).
-// For the cleanup commit this is a no-op stub: returns false so the
-// BRAM keeps its synthesized FlashFile-magic .hex baseline (i.e., a
-// fresh-EEPROM cold boot, identical to behaviour before any load
-// support existed).
+// NVR_LOAD_INDEX must match the localparam in Minimig.sv that gates
+// hps_io.ioctl_download into the akiko_nvram BRAM load port. Bytes
+// stream over SPI via UIO_FILE_TX → hps_io.ioctl_download → akiko_nvram
+// .load_we, completely outside the CD32 CPU reset domain (the BRAM
+// instance has reset(1'b0)), so this works whether or not BIOS is
+// running when we send it.
+#define AKIKO_NVR_LOAD_INDEX 1
+
 static bool akiko_nvram_load_from_path(const char *path)
 {
-	(void)path;
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		akiko_diag("[akiko] NVR load skip: no file at %s (errno=%d)",
+		           path, errno);
+		return false;
+	}
+	if (st.st_size != AKIKO_NVRAM_BYTES) {
+		akiko_diag("[akiko] NVR load skip: %s wrong size %lld (want %d)",
+		           path, (long long)st.st_size, AKIKO_NVRAM_BYTES);
+		return false;
+	}
+
+	// user_io_file_tx streams the file through hps_io's UIO_FILE_TX
+	// state machine, which presents bytes one at a time on
+	// ioctl_dout/ioctl_addr/ioctl_wr while ioctl_download is high.
+	// Minimig.sv gates the akiko_nvram write port by ioctl_index ==
+	// AKIKO_NVR_LOAD_INDEX so other indices can't corrupt the BRAM.
+	int rc = user_io_file_tx(path, AKIKO_NVR_LOAD_INDEX, /*opensave*/0,
+	                         /*mute*/1, /*composite*/0, /*load_addr*/0);
+	if (rc != 1) {
+		akiko_diag("[akiko] NVR load FAIL: user_io_file_tx(%s, idx=%d) rc=%d",
+		           path, AKIKO_NVR_LOAD_INDEX, rc);
+		cd_save_load_failed = true;
+		return false;
+	}
+
+	// Verify pass: read back the BRAM via the save-dump sub-channel
+	// and compare to the file. If the load path is silently no-op the
+	// readback will mismatch and we get an immediate diagnostic instead
+	// of a "save not persisting" mystery surfacing only later.
+	uint8_t verify[AKIKO_NVRAM_BYTES];
+	akiko_nvram_dump(verify);
+	uint8_t expected[AKIKO_NVRAM_BYTES];
+	FILE *f = fopen(path, "rb");
+	if (f) {
+		size_t got = fread(expected, 1, AKIKO_NVRAM_BYTES, f);
+		fclose(f);
+		if (got == AKIKO_NVRAM_BYTES &&
+		    memcmp(expected, verify, AKIKO_NVRAM_BYTES) == 0) {
+			akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
+			           AKIKO_NVRAM_BYTES, path);
+			cd_save_load_failed = false;
+			return true;
+		}
+		int first_bad = -1, mismatches = 0;
+		if (got == AKIKO_NVRAM_BYTES) {
+			for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
+				if (verify[i] != expected[i]) {
+					if (first_bad < 0) first_bad = i;
+					mismatches++;
+				}
+			}
+		}
+		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x)",
+		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
+	}
+	cd_save_load_failed = true;
 	return false;
 }
 
