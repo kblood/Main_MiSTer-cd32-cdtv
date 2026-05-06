@@ -1092,6 +1092,16 @@ static bool akiko_nvram_load_from_path(const char *path)
 		}
 		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x)",
 		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
+		if (got == AKIKO_NVRAM_BYTES) {
+			int logged = 0;
+			for (int i = 0; i < AKIKO_NVRAM_BYTES && logged < 32; i++) {
+				if (verify[i] != expected[i]) {
+					akiko_diag("[akiko]   @0x%03x: got 0x%02x want 0x%02x",
+					           i, verify[i], expected[i]);
+					logged++;
+				}
+			}
+		}
 	}
 	cd_save_load_failed = true;
 	return false;
