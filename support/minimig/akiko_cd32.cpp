@@ -30,6 +30,7 @@
 #include "../../ide.h"
 #include "../../ide_cdrom.h"
 #include "../../hardware.h"   // GetTimer / CheckTimer
+#include "../../menu.h"       // menu_present() — OSD-open save trigger
 #include "../chd/mister_chd.h" // mister_chd_read_sector for CDDA pump
 #include "akiko_cd32.h"
 
@@ -2083,39 +2084,51 @@ void akiko_cd32_poll(void)
 	// dump itself on rx_idle so a save doesn't interleave with a queued
 	// MULTI response, but the timestamp tracking runs unconditionally.
 	{
-		static uint32_t nvr_dirty_seen_at = 0;     // 0 = not currently dirty
-		static uint32_t nvr_last_save_at = 0;      // wall-clock of last successful save
-		const bool nvr_dirty_now = (status & AKIKO_STATUS_NVR_DIRTY) != 0;
+		static uint32_t nvr_dirty_seen_at    = 0;  // 0 = not currently dirty
+		static uint32_t nvr_last_save_at     = 0;  // wall-clock of last successful save
+		static int      nvr_menu_was_present = 0;  // for OSD-open rising-edge detect
+		const bool nvr_dirty_now  = (status & AKIKO_STATUS_NVR_DIRTY) != 0;
+		const int  nvr_menu_now   = menu_present();
+		// OSD-open rising edge: user popped open the OSD menu. Mirrors
+		// arcade core pattern at menu.cpp:2217 (UIO_CHK_UPLOAD-driven
+		// arcade_nvm_save). Treats OSD-open as "user is about to swap CD,
+		// reset, or power down" — flush any pending dirty save now while
+		// we still have the data and user attention. Saves the player from
+		// the throttle window (which can lose 30s of progress on quick
+		// reset).
+		const bool osd_open_edge  = nvr_menu_now && !nvr_menu_was_present;
+		nvr_menu_was_present      = nvr_menu_now;
+
 		if (nvr_dirty_now) {
 			cd_save_dirty_observed = true;     // arms set_cd_path flush
 			uint32_t now_ms = (uint32_t)GetTimer(0);
 			if (!nvr_dirty_seen_at) {
 				nvr_dirty_seen_at = now_ms;
 				akiko_diag("[akiko] NVR dirty observed at t=%u", now_ms);
-			} else if (rx_idle &&
-			           (now_ms - nvr_dirty_seen_at) >= AKIKO_NVRAM_DIRTY_DEBOUNCE_MS) {
-				// Min-interval cooldown: even if the dirty-debounce window
-				// keeps re-firing (e.g. a save loop), don't write to SD
-				// faster than once per AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS.
-				// The dirty bit stays set in hardware, so the next pass
-				// after the cooldown will pick it up. The idempotent-write
-				// guard inside save_to_path naturally drops byte-identical
-				// follow-ups, but this saves the SPI dump cost itself.
-				if (nvr_last_save_at &&
-				    (now_ms - nvr_last_save_at) < AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS) {
-					// Still within cooldown — don't even dump. Re-check
-					// next poll. Don't reset nvr_dirty_seen_at so we
-					// fire as soon as cooldown expires.
-				} else {
-					// Phase 32.5: bridge auto-clears dirty at end of the
-					// READ burst inside save_to_disk's nvram_dump, so no
-					// explicit clear-dirty SPI write is needed (and would
-					// in fact corrupt byte 0 under the new write-as-load
-					// bridge semantics).
-					akiko_nvram_save_to_disk();
-					nvr_dirty_seen_at = 0;
-					nvr_last_save_at  = now_ms;
+			}
+			// Fire on EITHER OSD-open-with-dirty (preferred — explicit
+			// user intent, matches arcade pattern) OR the 30s debounce
+			// expiring as a safety net for sessions where the user never
+			// reopens OSD before power-off.
+			const bool throttle_expired = rx_idle &&
+				(now_ms - nvr_dirty_seen_at) >= AKIKO_NVRAM_DIRTY_DEBOUNCE_MS;
+			const bool fire = osd_open_edge || throttle_expired;
+			// Min-interval cooldown still applies — protects against
+			// pathological save loops regardless of trigger.
+			const bool cooldown_clear = !nvr_last_save_at ||
+				(now_ms - nvr_last_save_at) >= AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS;
+			if (fire && cooldown_clear) {
+				if (osd_open_edge) {
+					akiko_diag("[akiko] NVR flush: OSD opened with dirty pending");
 				}
+				// Phase 32.5: bridge auto-clears dirty at end of the
+				// READ burst inside save_to_disk's nvram_dump, so no
+				// explicit clear-dirty SPI write is needed (and would
+				// in fact corrupt byte 0 under the new write-as-load
+				// bridge semantics).
+				akiko_nvram_save_to_disk();
+				nvr_dirty_seen_at = 0;
+				nvr_last_save_at  = now_ms;
 			}
 		} else {
 			// Flag dropped (RTL reset, or we just cleared it). Re-arm.
