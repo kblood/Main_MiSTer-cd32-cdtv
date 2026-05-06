@@ -3137,8 +3137,14 @@ void user_io_poll()
 	{
 		x86_poll(0);
 	}
-	else if ((core_type == CORE_TYPE_8BIT) && !is_menu() && !is_minimig())
+	else if ((core_type == CORE_TYPE_8BIT) && !is_menu())
 	{
+		// CD32 fork: Minimig participates in SD-block polling for the
+		// NVRAM .nvr load path (hps_io VDNUM=1, BLKSZ=3 → slot 0 = 1 KiB
+		// NVR). The per-core sub-pollers below are all gated by their own
+		// is_<core>() checks and skip Minimig naturally; the for-loop's
+		// generic SD-request handler then services sd_rd[0] when our
+		// in-RTL FSM raises it on img_mounted.
 		if (is_st()) tos_poll();
 		if (is_snes() || is_sgb()) snes_poll();
 		mdplus_poll(); // MD+ CDDA poll

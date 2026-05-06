@@ -1027,13 +1027,19 @@ static void akiko_nvram_dump(uint8_t *out_1024)
 	DisableIO();
 }
 
-// NVR_LOAD_INDEX must match the localparam in Minimig.sv that gates
-// hps_io.ioctl_download into the akiko_nvram BRAM load port. Bytes
-// stream over SPI via UIO_FILE_TX → hps_io.ioctl_download → akiko_nvram
-// .load_we, completely outside the CD32 CPU reset domain (the BRAM
-// instance has reset(1'b0)), so this works whether or not BIOS is
-// running when we send it.
-#define AKIKO_NVR_LOAD_INDEX 1
+// Canonical SD-block load path. user_io_file_mount registers the .nvr
+// as virtual disk slot 0; hps_io fires img_mounted, the in-core FSM in
+// Minimig.sv asserts sd_rd[0] with sd_lba=0, hps_io reads the file and
+// streams every byte on sd_buff_dout / sd_buff_wr / sd_buff_addr, and
+// Minimig.sv pipes that straight into akiko_nvram.load_we. Sidesteps
+// the gp_out CDC freeze that broke the ioctl_download path on hardware.
+//
+// Userspace returns immediately after mounting — the actual BRAM fill
+// happens asynchronously. Verify deferred to a poll-driven check below
+// (akiko_nvram_verify_load_pending), once the FPGA-side FSM has had
+// time to walk the LBA.
+static uint32_t  nvr_verify_due_at_ms = 0;        // 0 = no verify pending
+static char      nvr_verify_path[1024];
 
 static bool akiko_nvram_load_from_path(const char *path)
 {
@@ -1049,62 +1055,84 @@ static bool akiko_nvram_load_from_path(const char *path)
 		return false;
 	}
 
-	// user_io_file_tx streams the file through hps_io's UIO_FILE_TX
-	// state machine, which presents bytes one at a time on
-	// ioctl_dout/ioctl_addr/ioctl_wr while ioctl_download is high.
-	// Minimig.sv gates the akiko_nvram write port by ioctl_index ==
-	// AKIKO_NVR_LOAD_INDEX so other indices can't corrupt the BRAM.
-	int rc = user_io_file_tx(path, AKIKO_NVR_LOAD_INDEX, /*opensave*/0,
-	                         /*mute*/1, /*composite*/0, /*load_addr*/0);
+	// user_io_file_mount → UIO_SET_SDINFO + UIO_SET_SDSTAT over SPI.
+	// hps_io drops a single-cycle img_mounted[0] pulse with img_size set;
+	// Minimig.sv's edge-detect FSM kicks off the LBA-0 read on the next
+	// clk_sys edge.
+	int rc = user_io_file_mount(path, /*index*/0, /*pre*/0, /*pre_size*/0);
 	if (rc != 1) {
-		akiko_diag("[akiko] NVR load FAIL: user_io_file_tx(%s, idx=%d) rc=%d",
-		           path, AKIKO_NVR_LOAD_INDEX, rc);
+		akiko_diag("[akiko] NVR mount FAIL: user_io_file_mount(%s, slot=0) rc=%d",
+		           path, rc);
 		cd_save_load_failed = true;
 		return false;
 	}
 
-	// Verify pass: read back the BRAM via the save-dump sub-channel
-	// and compare to the file. If the load path is silently no-op the
-	// readback will mismatch and we get an immediate diagnostic instead
-	// of a "save not persisting" mystery surfacing only later.
+	// Verify delay: load takes ~10-20 ms over SPI (BLKSZ=3, 1024 B per
+	// LBA, 4 user_io_poll iterations to fire the request once the
+	// !is_minimig() gate in user_io.cpp was lifted). 100 ms is well
+	// past completion while still catching the load before BIOS has
+	// done meaningful FlashFile-bootstrap work.
+	akiko_diag("[akiko] NVR mounted slot 0 (%d bytes from %s) — verify in 100 ms",
+	           AKIKO_NVRAM_BYTES, path);
+	cd_save_load_failed = false;
+	strncpy(nvr_verify_path, path, sizeof(nvr_verify_path) - 1);
+	nvr_verify_path[sizeof(nvr_verify_path) - 1] = '\0';
+	nvr_verify_due_at_ms = (uint32_t)GetTimer(100);
+	return true;
+}
+
+// Called from akiko_cd32_poll. When the deferred-verify timer expires,
+// dump the BRAM via the existing save sub-channel and compare to what's
+// on disk. Sets cd_save_load_failed if mismatch (which gates the
+// dirty-detect → save path so we don't overwrite a real file with a
+// broken load).
+static void akiko_nvram_verify_load_pending(void)
+{
+	if (!nvr_verify_due_at_ms) return;
+	if (!CheckTimer(nvr_verify_due_at_ms)) return;
+	nvr_verify_due_at_ms = 0;
+
 	uint8_t verify[AKIKO_NVRAM_BYTES];
 	akiko_nvram_dump(verify);
 	uint8_t expected[AKIKO_NVRAM_BYTES];
-	FILE *f = fopen(path, "rb");
-	if (f) {
-		size_t got = fread(expected, 1, AKIKO_NVRAM_BYTES, f);
-		fclose(f);
-		if (got == AKIKO_NVRAM_BYTES &&
-		    memcmp(expected, verify, AKIKO_NVRAM_BYTES) == 0) {
-			akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
-			           AKIKO_NVRAM_BYTES, path);
-			cd_save_load_failed = false;
-			return true;
+	FILE *f = fopen(nvr_verify_path, "rb");
+	if (!f) {
+		akiko_diag("[akiko] NVR verify: fopen(%s) failed errno=%d",
+		           nvr_verify_path, errno);
+		cd_save_load_failed = true;
+		return;
+	}
+	size_t got = fread(expected, 1, AKIKO_NVRAM_BYTES, f);
+	fclose(f);
+	if (got != AKIKO_NVRAM_BYTES) {
+		akiko_diag("[akiko] NVR verify: short read %zu/%d", got, AKIKO_NVRAM_BYTES);
+		cd_save_load_failed = true;
+		return;
+	}
+	if (memcmp(expected, verify, AKIKO_NVRAM_BYTES) == 0) {
+		akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
+		           AKIKO_NVRAM_BYTES, nvr_verify_path);
+		cd_save_load_failed = false;
+		return;
+	}
+	int first_bad = -1, mismatches = 0;
+	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
+		if (verify[i] != expected[i]) {
+			if (first_bad < 0) first_bad = i;
+			mismatches++;
 		}
-		int first_bad = -1, mismatches = 0;
-		if (got == AKIKO_NVRAM_BYTES) {
-			for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
-				if (verify[i] != expected[i]) {
-					if (first_bad < 0) first_bad = i;
-					mismatches++;
-				}
-			}
-		}
-		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x)",
-		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
-		if (got == AKIKO_NVRAM_BYTES) {
-			int logged = 0;
-			for (int i = 0; i < AKIKO_NVRAM_BYTES && logged < 32; i++) {
-				if (verify[i] != expected[i]) {
-					akiko_diag("[akiko]   @0x%03x: got 0x%02x want 0x%02x",
-					           i, verify[i], expected[i]);
-					logged++;
-				}
-			}
+	}
+	akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x)",
+	           mismatches, AKIKO_NVRAM_BYTES, first_bad);
+	int logged = 0;
+	for (int i = 0; i < AKIKO_NVRAM_BYTES && logged < 32; i++) {
+		if (verify[i] != expected[i]) {
+			akiko_diag("[akiko]   @0x%03x: got 0x%02x want 0x%02x",
+			           i, verify[i], expected[i]);
+			logged++;
 		}
 	}
 	cd_save_load_failed = true;
-	return false;
 }
 
 // Atomic save to a specific path: dump → write to .tmp → fsync → rename →
@@ -1872,6 +1900,11 @@ void akiko_cd32_poll(void)
 			}
 		}
 	}
+
+	// SD-block load is asynchronous (img_mounted edge → FPGA FSM walks
+	// LBA 0). akiko_nvram_load_from_path schedules a verify ~250 ms out;
+	// service it here once the deadline passes.
+	akiko_nvram_verify_load_pending();
 
 	// Always drain — the ring back-pressures the CPU when full. Per-entry
 	// logging is gated inside the function on AKIKO_BUS_TRACE.
