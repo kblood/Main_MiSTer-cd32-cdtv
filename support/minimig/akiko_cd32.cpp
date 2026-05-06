@@ -82,9 +82,9 @@ static void akiko_diag(const char *fmt, ...);
 
 // Status-poll cmd byte. Returns one 16-bit word; bit[11] = akiko_req,
 // bit[10] = akiko_sec_req (M4 PBX wants a sector pushed).
-#define AKIKO_STATUS_CMD     0x63
-#define AKIKO_STATUS_REQ     (1u << 11)
-#define AKIKO_STATUS_SEC_REQ (1u << 10)
+#define AKIKO_STATUS_CMD             0x63
+#define AKIKO_STATUS_REQ             (1u << 11)
+#define AKIKO_STATUS_SEC_REQ         (1u << 10)
 // Phase 18: bit[9] = akiko_rx_busy = (cdrom_receive_length != 0). Mirror of
 // WinUAE's cdrom_can_return_data() gate: when set, the FPGA RX engine still
 // has a queued/in-flight response and we must NOT push another frame, or it
@@ -114,7 +114,17 @@ static void akiko_diag(const char *fmt, ...);
 // this long for the dirty state to stabilize before saving (debounces
 // bursty BIOS FlashFile commits, which may take multiple I2C writes).
 #define AKIKO_NVRAM_POLL_PERIOD_MS    1000
-#define AKIKO_NVRAM_DIRTY_DEBOUNCE_MS 5000
+// 30s debounce: BIOS often re-writes the same FlashFile entries multiple
+// times within a few seconds during a save sequence. Idempotent-write
+// guard already drops byte-identical re-saves, but we still pay the SPI
+// dump cost (~50 ms). Bumping the debounce from 5s reduces dump churn
+// from ~12/min worst case to ~2/min, which matters for SD-card wear and
+// for the power-cut window during fsync.
+#define AKIKO_NVRAM_DIRTY_DEBOUNCE_MS 30000
+// Minimum interval between two consecutive saves to disk. Even if the
+// BIOS keeps making distinct dirty-burst sequences, we won't write to SD
+// faster than once per N ms. Protects against pathological save loops.
+#define AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS 60000
 
 // Trace sub-channel: io_din[7] = 1 selects the akiko_bus_trace ring buffer
 // (hps_ext.v: akiko_cs_trace). Each entry is 4 bytes:
@@ -1017,86 +1027,17 @@ static void akiko_nvram_dump(uint8_t *out_1024)
 	DisableIO();
 }
 
-// Phase 32.5: load 1024 bytes from a save file into FPGA NVRAM BRAM via
-// the host write port (UIO_DMA_WRITE on the nvr sub-channel). Returns true
-// if the file existed at the right size and was streamed; false (silently)
-// otherwise — in which case BRAM keeps its synthesized FlashFile-magic
-// init, behaving as a fresh empty EEPROM (the pre-Phase-32.5 cold-boot
-// behavior). The bridge does NOT touch the dirty flag on writes, so
-// loading does not provoke an immediate re-save on the next poll.
+// Load 1024 bytes from a save file into FPGA NVRAM BRAM. The actual
+// transport will be wired in the next commit (canonical
+// hps_io.ioctl_download path → akiko_nvram.load_we BRAM write port).
+// For the cleanup commit this is a no-op stub: returns false so the
+// BRAM keeps its synthesized FlashFile-magic .hex baseline (i.e., a
+// fresh-EEPROM cold boot, identical to behaviour before any load
+// support existed).
 static bool akiko_nvram_load_from_path(const char *path)
 {
-	struct stat st;
-	if (stat(path, &st) != 0) {
-		akiko_diag("[akiko] NVR load skip: no file at %s (errno=%d)",
-		           path, errno);
-		return false;
-	}
-	if (st.st_size != AKIKO_NVRAM_BYTES) {
-		akiko_diag("[akiko] NVR load skip: %s wrong size %lld (want %d)",
-		           path, (long long)st.st_size, AKIKO_NVRAM_BYTES);
-		return false;
-	}
-
-	uint8_t buf[AKIKO_NVRAM_BYTES];
-	FILE *f = fopen(path, "rb");
-	if (!f) {
-		akiko_diag("[akiko] NVR fopen(%s, rb) failed: errno=%d",
-		           path, errno);
-		return false;
-	}
-	size_t got = fread(buf, 1, AKIKO_NVRAM_BYTES, f);
-	fclose(f);
-	if (got != AKIKO_NVRAM_BYTES) {
-		akiko_diag("[akiko] NVR fread short: got %zu want %d",
-		           got, AKIKO_NVRAM_BYTES);
-		return false;
-	}
-
-	EnableIO();
-	spi8(UIO_DMA_WRITE);
-	spi32_w(AKIKO_NVRAM_ADDR);
-	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
-		spi_w(buf[i]);
-	}
-	DisableIO();
-
-	// Phase 33-A (2026-05-04): verify-pass — read back what we just wrote
-	// and compare to the file contents. If the BRAM port-B write side is
-	// silently no-op (Quartus M10K mis-inferred as SDP — see
-	// research/docs/winuae-nvram-analysis.md root cause #1), this readback
-	// will mismatch and we get an immediate diagnostic instead of a
-	// silent "save not persisting" bug surfacing only in CF later.
-	uint8_t verify[AKIKO_NVRAM_BYTES];
-	akiko_nvram_dump(verify);
-	int mismatches = 0;
-	int first_bad = -1;
-	for (int i = 0; i < AKIKO_NVRAM_BYTES; i++) {
-		if (verify[i] != buf[i]) {
-			if (first_bad < 0) first_bad = i;
-			mismatches++;
-		}
-	}
-	if (mismatches) {
-		// Phase 33-A: known-broken host_we write path (3 Quartus iterations
-		// in 2026-05-04 didn't fix it; deferred). See known-issues-deferred.md.
-		// We log a one-line summary and proceed — BIOS will recreate the
-		// FlashFile baseline from scratch on cold boot, so the load-from-disk
-		// failure is non-fatal but means saved game state is lost across boots.
-		akiko_diag("[akiko] NVR LOAD VERIFY FAILED: %d/%d mismatched (first @ 0x%03x). "
-		           "host_we path broken — saves not restored. See deferred issue.",
-		           mismatches, AKIKO_NVRAM_BYTES, first_bad);
-		// Block writeback for this slot — BRAM contents are now the .mif
-		// baseline, not the disk file. If we let dirty-detect persist what
-		// BIOS does next, we'll silently overwrite the user's real save
-		// with the synthesized FlashFile bootstrap (observed 2026-05-04).
-		cd_save_load_failed = true;
-	} else {
-		akiko_diag("[akiko] NVR loaded %d bytes from %s (verify OK)",
-		           AKIKO_NVRAM_BYTES, path);
-		cd_save_load_failed = false;
-	}
-	return true;
+	(void)path;
+	return false;
 }
 
 // Atomic save to a specific path: dump → write to .tmp → fsync → rename →
@@ -1114,17 +1055,47 @@ static bool akiko_nvram_save_to_path(const char *path)
 	uint8_t buf[AKIKO_NVRAM_BYTES];
 	akiko_nvram_dump(buf);
 
-	// Idempotent-write guard. Read current file (if any) and compare.
+	// Idempotent-write guard + bootstrap-overwrite guard. Read current file
+	// (if any) and compare.
+	//
+	// (a) Idempotent: if dump matches disk byte-for-byte, skip rewrite.
+	//     BIOS often re-writes the same value (entry-accessed flag etc.) and
+	//     we don't want to churn the SD card or update mtime for a no-op.
+	//
+	// (b) Bootstrap-overwrite: if dump has ZERO meaningful content past the
+	//     FlashFile root header (bytes 25..1023 all zero) AND the disk file
+	//     has data there, refuse the write. This catches the destructive
+	//     cascade observed 2026-05-04: BIOS rebuilds the empty FlashFile
+	//     bootstrap (bytes 0..24 only) from scratch when it can't recognize
+	//     the existing NVRAM contents → dirty-detect captures the rebuild
+	//     → save would silently overwrite the user's real save with the
+	//     bootstrap. Real games leave entry data in the 25..1023 region.
 	{
 		FILE *cur = fopen(path, "rb");
 		if (cur) {
 			uint8_t disk_buf[AKIKO_NVRAM_BYTES];
 			size_t n = fread(disk_buf, 1, AKIKO_NVRAM_BYTES, cur);
 			fclose(cur);
-			if (n == AKIKO_NVRAM_BYTES &&
-			    memcmp(disk_buf, buf, AKIKO_NVRAM_BYTES) == 0) {
-				akiko_diag("[akiko] NVR save skipped: identical to %s", path);
-				return true;
+			if (n == AKIKO_NVRAM_BYTES) {
+				if (memcmp(disk_buf, buf, AKIKO_NVRAM_BYTES) == 0) {
+					akiko_diag("[akiko] NVR save skipped: identical to %s", path);
+					return true;
+				}
+				// Bootstrap-overwrite check
+				int buf_entry_nz  = 0;
+				int disk_entry_nz = 0;
+				for (int i = 25; i < AKIKO_NVRAM_BYTES; i++) {
+					if (buf[i])      buf_entry_nz++;
+					if (disk_buf[i]) disk_entry_nz++;
+				}
+				if (buf_entry_nz == 0 && disk_entry_nz > 0) {
+					akiko_diag("[akiko] NVR save BLOCKED: about to overwrite "
+					           "%s (%d entry bytes) with empty FlashFile bootstrap "
+					           "(0 entry bytes) — destructive cascade detected, "
+					           "refusing.",
+					           path, disk_entry_nz);
+					return false;
+				}
 			}
 		}
 	}
@@ -2013,6 +1984,7 @@ void akiko_cd32_poll(void)
 	// MULTI response, but the timestamp tracking runs unconditionally.
 	{
 		static uint32_t nvr_dirty_seen_at = 0;     // 0 = not currently dirty
+		static uint32_t nvr_last_save_at = 0;      // wall-clock of last successful save
 		const bool nvr_dirty_now = (status & AKIKO_STATUS_NVR_DIRTY) != 0;
 		if (nvr_dirty_now) {
 			cd_save_dirty_observed = true;     // arms set_cd_path flush
@@ -2022,13 +1994,28 @@ void akiko_cd32_poll(void)
 				akiko_diag("[akiko] NVR dirty observed at t=%u", now_ms);
 			} else if (rx_idle &&
 			           (now_ms - nvr_dirty_seen_at) >= AKIKO_NVRAM_DIRTY_DEBOUNCE_MS) {
-				// Phase 32.5: bridge auto-clears dirty at end of the
-				// READ burst inside save_to_disk's nvram_dump, so no
-				// explicit clear-dirty SPI write is needed (and would
-				// in fact corrupt byte 0 under the new write-as-load
-				// bridge semantics).
-				akiko_nvram_save_to_disk();
-				nvr_dirty_seen_at = 0;
+				// Min-interval cooldown: even if the dirty-debounce window
+				// keeps re-firing (e.g. a save loop), don't write to SD
+				// faster than once per AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS.
+				// The dirty bit stays set in hardware, so the next pass
+				// after the cooldown will pick it up. The idempotent-write
+				// guard inside save_to_path naturally drops byte-identical
+				// follow-ups, but this saves the SPI dump cost itself.
+				if (nvr_last_save_at &&
+				    (now_ms - nvr_last_save_at) < AKIKO_NVRAM_MIN_SAVE_INTERVAL_MS) {
+					// Still within cooldown — don't even dump. Re-check
+					// next poll. Don't reset nvr_dirty_seen_at so we
+					// fire as soon as cooldown expires.
+				} else {
+					// Phase 32.5: bridge auto-clears dirty at end of the
+					// READ burst inside save_to_disk's nvram_dump, so no
+					// explicit clear-dirty SPI write is needed (and would
+					// in fact corrupt byte 0 under the new write-as-load
+					// bridge semantics).
+					akiko_nvram_save_to_disk();
+					nvr_dirty_seen_at = 0;
+					nvr_last_save_at  = now_ms;
+				}
 			}
 		} else {
 			// Flag dropped (RTL reset, or we just cleared it). Re-arm.

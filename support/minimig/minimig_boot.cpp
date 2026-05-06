@@ -12,6 +12,7 @@
 #include "../../file_io.h"
 #include "minimig_config.h"
 #include "minimig_fdd.h"
+#include "akiko_cd32.h"
 #include "../../cfg.h"
 
 static uint8_t buffer[1024];
@@ -423,6 +424,13 @@ void BootInit()
 
 	minimig_config.kickstart[0] = 0;
 	minimig_cfg_load(0);
+
+	// 2026-05-05: MGL load lands here instead of going through minimig_reset(),
+	// so akiko_cd32_init() — which clears CDDA/play/TOC/prefetch/dirty state
+	// AND schedules the NVR reload after the FPGA-reflash BRAM wipe — was
+	// being skipped on every MGL boot. Only the OSD reset combo (Ctrl+Alt+RAlt)
+	// hit the init path. Fix the asymmetry by running it here too.
+	akiko_cd32_init();
 }
 
 void BootPrintEx(const char * str)
