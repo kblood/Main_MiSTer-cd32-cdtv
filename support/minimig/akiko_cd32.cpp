@@ -279,11 +279,15 @@ static uint8_t  cd_post_info_media_push_pending = 0;
 // has seen each point TOC_REPEAT times. WinUAE pushes one per video frame
 // (akiko.cpp:1438-1440). Without this, CD32 BIOS sits at the spinning-CD
 // splash forever — it never sends MULTI/READ until TOC is known.
-//   AKIKO_TOC_MAX_POINTS = 0xA0 + 0xA1 + 0xA2 + up to 99 tracks; cap at 16
-//   for our M5 use case (Cannon Fodder = 2 tracks → 5 points).
+//   AKIKO_TOC_MAX_POINTS = 0xA0 + 0xA1 + 0xA2 + up to 99 tracks. The original
+//   M5 cap of 16 was sized for Cannon Fodder (2 tracks → 5 points). Bumped
+//   to 32 on 2026-05-07 after Fire & Ice (23-track multi-CDDA disc) was
+//   observed truncating its TOC to 13 audio points and wedging post-scan-TOC.
+//   32 covers everything in the user's collection (Fire & Ice has the most
+//   tracks at 23; AKIKO_TOC_REPEAT=3 still keeps the drip under 2s @ 20ms/frame).
 #define AKIKO_TOC_REPEAT       3
 #define AKIKO_TOC_PUSH_PERIOD_MS 20 // 50 Hz, matches WinUAE PAL framesync (akiko.cpp:1438)
-#define AKIKO_TOC_MAX_POINTS   16
+#define AKIKO_TOC_MAX_POINTS   32
 static uint8_t  toc_buffer[AKIKO_TOC_MAX_POINTS * 13];
 static uint8_t  toc_point_count     = 0;
 static int16_t  toc_push_idx        = -1;   // -1 = idle; else next slot in 3x sequence
