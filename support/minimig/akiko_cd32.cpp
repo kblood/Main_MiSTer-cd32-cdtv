@@ -1278,24 +1278,24 @@ static bool akiko_nvram_save_to_disk(void)
 
 // Push 2352 bytes to the akiko sector_buffer. Two paths coexist:
 //
-//   Default (AKIKO_FAST_PUSH unset): UIO_DMA_WRITE on 0xF500 (sec sub-channel
-//   of 0xF400). Per-byte SSPI_ACK round-trip → ~2.3 ms/sector. Bridge ends the
-//   transfer with hps_sec_done; akiko.v latches sector_ready iff every byte
-//   landed (sec_wr_ptr == 2352).
-//
-//   AKIKO_FAST_PUSH=1: UIO_SECTOR_RD on slot AKIKO_SEC_SLOT, then
+//   Default: UIO_SECTOR_RD on slot AKIKO_SEC_SLOT, then
 //   fpga_spi_fast_block_write_8(buf, 2352). hps_io's b_wr<<1 pipeline drives
 //   sd_buff_wr / sd_buff_addr / sd_buff_dout per byte at SPI clock without
 //   needing ACK round-trips. akiko.v captures via sd_ack[AKIKO_SEC_SLOT] gate;
-//   sector_ready latches when sd_buff_addr hits 2351. Targets ~0.1 ms/sector.
+//   sector_ready latches when sd_buff_addr hits 2351. Measured ~0.95 ms/sector
+//   (hardware A/B, 2026-05-07).
+//
+//   AKIKO_SLOW_PUSH=1 (escape hatch): UIO_DMA_WRITE on 0xF500 (sec sub-channel
+//   of 0xF400). Per-byte SSPI_ACK round-trip → ~2.3 ms/sector. Bridge ends the
+//   transfer with hps_sec_done; akiko.v latches sector_ready iff every byte
+//   landed (sec_wr_ptr == 2352). Kept as a fallback in case a future regression
+//   needs to A/B against the slow path without rebuilding.
 //
 // The fast path needs the matching RTL (Minimig.sv VDNUM=2, akiko_sec_dma_*
-// wiring) — without it, sd_ack[1] never asserts and bytes go nowhere.
-// Earlier 2026-05-07 attempt with the OLD RTL (fpga_spi_fast on UIO_DMA_WRITE)
-// wedged because the framework SPI deserializer drops back-to-back strobes on
-// the 0x61 cmd path; SECTOR_RD (0x17) has dedicated fast handling.
+// wiring) — without it, sd_ack[1] never asserts and bytes go nowhere. Bundled
+// shipped RBFs (May 2026 onward) include this RTL.
 #define AKIKO_SEC_SLOT 1   // hps_io disk slot wired to akiko.v's hps_sec_dma_*
-static const bool g_akiko_fast_push = (getenv("AKIKO_FAST_PUSH") != nullptr);
+static const bool g_akiko_fast_push = (getenv("AKIKO_SLOW_PUSH") == nullptr);
 
 static void akiko_push_sector(const uint8_t *buf)
 {
