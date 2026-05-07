@@ -1277,11 +1277,20 @@ static bool akiko_nvram_save_to_disk(void)
 
 // Push 2352 bytes via UIO_DMA_WRITE on the sec sub-channel. The bridge
 // pulses hps_sec_done on deselect, which latches sector_ready in the engine
-// and unblocks the PBX state machine.
+// (only when sec_wr_ptr == 2352, i.e. every byte was captured) and unblocks
+// the PBX state machine.
 //
 // Loop uses spi_w (which respects SSPI_ACK back-pressure). The "fast" block
-// helpers skip the ack handshake and race past the bridge — confirmed to
-// drop bytes on this engine.
+// helpers skip the ack handshake and race past the framework SPI
+// deserializer in hps_io.sv — empirically re-verified 2026-05-07: with
+// AKIKO_FAST_PUSH=1, push completes in ~150 µs but sec_wr_ptr never reaches
+// 2352 at hps_sec_done so sector_ready stays 0; CF wedges on the
+// "Accessing CD32" splash with 27 PLAY DATA arms vs 4 sec_reqs (BIOS
+// retry loop). The drop is *upstream* of akiko_hps_bridge — adding a
+// bridge-side FIFO does not help. The actual fix is to migrate the sector
+// path to the framework's UIO_SECTOR_RD-style protocol (b_wr pipeline +
+// auto-incrementing sd_buff_addr in sys/hps_io.sv), which has dedicated
+// fast-burst handling. See research/docs/known-issues-deferred.md.
 static void akiko_push_sector(const uint8_t *buf)
 {
 	EnableIO();
