@@ -26,6 +26,7 @@
 #include <byteswap.h>     // bswap_16 for CDDA big-endian → host conversion
 
 #include "../../spi.h"
+#include "../../fpga_io.h"     // fpga_spi_fast_block_write_8 (M5+ SECTOR_RD fast path)
 #include "../../user_io.h"
 #include "../../ide.h"
 #include "../../ide_cdrom.h"
@@ -1275,31 +1276,43 @@ static bool akiko_nvram_save_to_disk(void)
 	return akiko_nvram_save_to_path(target);
 }
 
-// Push 2352 bytes via UIO_DMA_WRITE on the sec sub-channel. The bridge
-// pulses hps_sec_done on deselect, which latches sector_ready in the engine
-// (only when sec_wr_ptr == 2352, i.e. every byte was captured) and unblocks
-// the PBX state machine.
+// Push 2352 bytes to the akiko sector_buffer. Two paths coexist:
 //
-// Loop uses spi_w (which respects SSPI_ACK back-pressure). The "fast" block
-// helpers skip the ack handshake and race past the framework SPI
-// deserializer in hps_io.sv — empirically re-verified 2026-05-07: with
-// AKIKO_FAST_PUSH=1, push completes in ~150 µs but sec_wr_ptr never reaches
-// 2352 at hps_sec_done so sector_ready stays 0; CF wedges on the
-// "Accessing CD32" splash with 27 PLAY DATA arms vs 4 sec_reqs (BIOS
-// retry loop). The drop is *upstream* of akiko_hps_bridge — adding a
-// bridge-side FIFO does not help. The actual fix is to migrate the sector
-// path to the framework's UIO_SECTOR_RD-style protocol (b_wr pipeline +
-// auto-incrementing sd_buff_addr in sys/hps_io.sv), which has dedicated
-// fast-burst handling. See research/docs/known-issues-deferred.md.
+//   Default (AKIKO_FAST_PUSH unset): UIO_DMA_WRITE on 0xF500 (sec sub-channel
+//   of 0xF400). Per-byte SSPI_ACK round-trip → ~2.3 ms/sector. Bridge ends the
+//   transfer with hps_sec_done; akiko.v latches sector_ready iff every byte
+//   landed (sec_wr_ptr == 2352).
+//
+//   AKIKO_FAST_PUSH=1: UIO_SECTOR_RD on slot AKIKO_SEC_SLOT, then
+//   fpga_spi_fast_block_write_8(buf, 2352). hps_io's b_wr<<1 pipeline drives
+//   sd_buff_wr / sd_buff_addr / sd_buff_dout per byte at SPI clock without
+//   needing ACK round-trips. akiko.v captures via sd_ack[AKIKO_SEC_SLOT] gate;
+//   sector_ready latches when sd_buff_addr hits 2351. Targets ~0.1 ms/sector.
+//
+// The fast path needs the matching RTL (Minimig.sv VDNUM=2, akiko_sec_dma_*
+// wiring) — without it, sd_ack[1] never asserts and bytes go nowhere.
+// Earlier 2026-05-07 attempt with the OLD RTL (fpga_spi_fast on UIO_DMA_WRITE)
+// wedged because the framework SPI deserializer drops back-to-back strobes on
+// the 0x61 cmd path; SECTOR_RD (0x17) has dedicated fast handling.
+#define AKIKO_SEC_SLOT 1   // hps_io disk slot wired to akiko.v's hps_sec_dma_*
+static const bool g_akiko_fast_push = (getenv("AKIKO_FAST_PUSH") != nullptr);
+
 static void akiko_push_sector(const uint8_t *buf)
 {
-	EnableIO();
-	spi8(UIO_DMA_WRITE);
-	spi32_w(AKIKO_SECTOR_ADDR);
-	for (int i = 0; i < AKIKO_SECTOR_BYTES; i++) {
-		spi_w(buf[i]);
+	if (g_akiko_fast_push) {
+		EnableIO();
+		spi_w(UIO_SECTOR_RD | (AKIKO_SEC_SLOT << 8));
+		fpga_spi_fast_block_write_8(buf, AKIKO_SECTOR_BYTES);
+		DisableIO();
+	} else {
+		EnableIO();
+		spi8(UIO_DMA_WRITE);
+		spi32_w(AKIKO_SECTOR_ADDR);
+		for (int i = 0; i < AKIKO_SECTOR_BYTES; i++) {
+			spi_w(buf[i]);
+		}
+		DisableIO();
 	}
-	DisableIO();
 }
 
 // -----------------------------------------------------------------------------
