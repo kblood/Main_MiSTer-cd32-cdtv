@@ -32,6 +32,8 @@
 #include "../../hardware.h"   // GetTimer / CheckTimer
 #include "../../menu.h"       // menu_present() — OSD-open save trigger
 #include "../chd/mister_chd.h" // mister_chd_read_sector for CDDA pump
+#include "minimig_config.h"   // minimig_reset() — used to unblock BIOS stuck
+                              // on no-CD splash after a boot-with-no-CD-then-mount.
 #include "akiko_cd32.h"
 
 // -----------------------------------------------------------------------------
@@ -258,6 +260,12 @@ static drive_t *cd_cdda_drv     = NULL;
 
 // Last mounted state — used to re-arm the auto-init when a disc is swapped.
 static bool     cd_last_mounted     = false;
+
+// Phase 33-E flag: when set, the next akiko_cd32_poll iteration will call
+// minimig_reset() (deferred from the mediachange handler so the edge-
+// detection code runs to completion first). Used only for the boot-with-
+// no-CD-then-mount recovery path; hot-swaps during gameplay never set it.
+static bool     g_akiko_pending_minimig_reset = false;
 
 // One-shot: push a fresh media-status frame on the next poll *after* INFO
 // has completed. Mimics WinUAE's mediachanged-still-set-after-init quirk
@@ -1864,6 +1872,21 @@ void akiko_cd32_poll(void)
 
 	bool mounted = cd_is_mounted();
 
+	// Phase 33-E: deferred minimig_reset for "BIOS stuck on no-CD splash"
+	// recovery. Set by the mediachange handler below when the unmount→mount
+	// edge fires with cd_initialized>=2 and no prior eject in this session.
+	// Fire at the top of the NEXT poll so the edge-detection code runs to
+	// completion first (TOC rebuild + state bookkeeping). Safe because the
+	// previous poll always exits through send_response's
+	// `akiko_wait_status_bit` barrier — no UIO_DMA_WRITE is mid-flight.
+	if (g_akiko_pending_minimig_reset) {
+		g_akiko_pending_minimig_reset = false;
+		akiko_diag("[akiko] mediachange: BIOS was stuck on no-CD splash, "
+		           "triggering minimig_reset() (Phase 33-E)");
+		minimig_reset();
+		return;  // Don't continue this poll — minimig_reset re-init'd everything.
+	}
+
 	// Heartbeat: prove poll loop reached us at all. Writes to a dedicated
 	// log file so it survives any stdout redirection MiSTer does after init.
 	// Phase 32.5.1: NVRAM load is no longer driven from here — it's
@@ -1944,6 +1967,16 @@ void akiko_cd32_poll(void)
 	// across mediachange and the mediachange push alone is enough.
 	static bool media_absent_push_pending = false;
 	static bool mediachanged_push_pending = false;
+	// Phase 33-E (2026-05-07): when the user boots with no CD, BIOS issues
+	// 0x07 INFO during the no-disc state (cd_initialized -> 2) then sits
+	// indefinitely on the spinning-CD splash. A subsequent insert produces a
+	// mediachange push (0x0a/0x01) that BIOS ignores — empirically verified
+	// (107-line akiko log, no CMDs after the push). The only thing that
+	// unblocks BIOS is a CPU reset (LCtrl+LAlt+RAlt or OSD->Reset). We
+	// distinguish "no-CD-boot then mount" (BIOS stuck) from "hot-swap during
+	// gameplay" (BIOS handles the push) by tracking whether an eject was
+	// observed earlier in this session.
+	static bool had_prior_unmount = false;
 	if (mounted != cd_last_mounted) {
 		cd_data_lba_base = -1;               // any in-progress read is stale
 		akiko_prefetch_invalidate();         // cache may be from previous disc
@@ -1962,6 +1995,7 @@ void akiko_cd32_poll(void)
 			// in akiko_reset, never on mediachange).
 			media_absent_push_pending = true;
 			mediachanged_push_pending = false;
+			had_prior_unmount = true;
 		} else {
 			// Just inserted. Rebuild TOC eagerly so it's fresh when BIOS
 			// queries (mirror WinUAE get_cdrom_toc() in mediachange branch
@@ -1970,11 +2004,23 @@ void akiko_cd32_poll(void)
 			media_absent_push_pending = false;
 			akiko_build_toc();
 			if (cd_initialized >= 2) {
-				// Insert AFTER INFO has run — use mediachange path. Pushes
-				// 0x0a/0x01 without regressing cd_initialized so the TOC
-				// drip can fire when BIOS issues MULTI 0x04. This is the
-				// boot-with-no-CD-then-mount fix (was broken pre-Phase 33-D).
-				mediachanged_push_pending = true;
+				if (had_prior_unmount) {
+					// Hot-swap during gameplay: BIOS already handled an eject
+					// in this session, so the mediachange push is sufficient
+					// (mirrors WinUAE's behaviour for the same case).
+					mediachanged_push_pending = true;
+				} else {
+					// Boot-with-no-CD-then-mount (Phase 33-E): BIOS booted
+					// past INFO without ever seeing a CD. Pushing 0x0a/0x01
+					// is empirically a no-op — BIOS ignores it. Defer a
+					// minimig_reset to fire on the NEXT poll iteration; that
+					// re-runs ApplyConfiguration with the CHD already open
+					// via the prior cdrom_parse, so the post-reset boot has
+					// mounted=1 from t=0 and the cold-boot auto-init path
+					// takes over normally.
+					g_akiko_pending_minimig_reset = true;
+					mediachanged_push_pending = false;
+				}
 			}
 			// Else (cd_initialized<2): cold-boot auto-init path will fire.
 		}
