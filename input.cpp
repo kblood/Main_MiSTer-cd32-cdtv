@@ -36,6 +36,7 @@
 #include "frame_timer.h"
 #include "scaler.h"
 #include "ide.h"
+#include "support/minimig/minimig_config.h"
 
 #define NUMDEV 30
 #define UINPUT_NAME "MiSTer virtual input"
@@ -5926,8 +5927,25 @@ int input_test(int getchar)
 						// the mediachange path (boot-with-no-CD-then-mount).
 						const char *path = cmd + 9;
 						while (*path == ' ' || *path == '\t') path++;
+						{
+							size_t maxlen = sizeof(minimig_config.hardfile[0].filename) - 1;
+							size_t plen = strlen(path);
+							if (plen > maxlen) plen = maxlen;
+							if (plen) memcpy(minimig_config.hardfile[0].filename, path, plen);
+							minimig_config.hardfile[0].filename[plen] = 0;
+						}
 						int rc = ide_open(0, path);
 						printf("MiSTer_cmd: mount_cd unit=0 path=\"%s\" rc=%d\n", path, rc);
+					}
+					else if (!strcmp(cmd, "unmount_cd") || !strncmp(cmd, "unmount_cd ", 11))
+					{
+						// CD32-fork test hook: mirrors OSD-unmount path exactly
+						// (clears minimig_config.hardfile[0].filename; does NOT
+						// call ide_open). The IDE drive state stays open until
+						// the next minimig_reset() / ApplyConfiguration runs
+						// hdd_open(0) → ide_open(0, "") → cleanup.
+						minimig_config.hardfile[0].filename[0] = 0;
+						printf("MiSTer_cmd: unmount_cd (cleared hardfile[0].filename, IDE state untouched)\n");
 					}
 				}
 			}

@@ -779,12 +779,86 @@ static void cmd_multi(const uint8_t *cmd)
 	// misclassify any future bit-6 use (likely a scan/seek flag).
 	bool data_read = (cmd[7] & 0x80) != 0;
 	if (data_read) {
-		// M4: arm the PBX sector fetcher. cdrom_sector_counter on the FPGA
-		// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
-		// LBA = base + counter holds across the full read pass.
-		cd_data_lba_base = (int32_t)s_lba;
-		r[1] = 0x02;
-		akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x)", (int32_t)s_lba, cmd[7]);
+		// Audio-track refusal. CR2/HQ2/Microcosm 2026-05-08: BIOS issues
+		// PLAY DATA on LBAs that fall inside audio tracks (CR2 LBA 37224,
+		// HQ2 LBA 25667 in pregap then 49810 in track 2 body, Microcosm
+		// 19213-area). Pushing real audio bytes produces a 4 ms garbage-
+		// CMD storm; pushing silence with counter advance feeds the BIOS
+		// file walker zeros that get re-encoded as a next-extent pointer;
+		// holding sec_req deadlocks BIOS.
+		//
+		// Synchronous refusal with CDS_PLAYEND mirrors WinUAE's natural
+		// play-end notification — BIOS sees the play has ended, treats
+		// the requested file as truncated, and walks to the next dirent.
+		// CDS_ERROR alone makes HQ2 retry the same LBA forever.
+		//
+		// Pregap classification: 150 frames before a track's body start
+		// belong to that track per MMC. Without explicit handling, LBAs
+		// in the gap (HQ2 25663-25812) fall through both per-track
+		// ranges, prefetch returns silence, BIOS reads zeros as a dirent
+		// extent and arms PLAY DATA at a garbage LBA.
+		drive_t *drv2 = cd_find_drive();
+		bool start_is_audio = false;
+		bool start_is_oob   = false;
+		if (drv2) {
+			int real_tracks2 = drv2->track_cnt > 0 ? drv2->track_cnt - 1 : 0;
+			uint32_t lead_out2 = (real_tracks2 > 0) ? drv2->track[real_tracks2].start : 0;
+			if (lead_out2 && s_lba >= lead_out2) {
+				start_is_oob = true;
+			}
+			for (int i = 0; i < real_tracks2 && !start_is_oob; i++) {
+				uint32_t body_end = drv2->track[i].start + drv2->track[i].length;
+				if (s_lba >= drv2->track[i].start && s_lba < body_end) {
+					start_is_audio = !(drv2->track[i].attr & 0x40);
+					break;
+				}
+				// Pregap region between this track's body end and next
+				// track's start. Belongs to the NEXT track per MMC, so
+				// classify by the next track's attr.
+				if (i + 1 < real_tracks2 &&
+				    s_lba >= body_end && s_lba < drv2->track[i + 1].start) {
+					start_is_audio = !(drv2->track[i + 1].attr & 0x40);
+					break;
+				}
+			}
+		}
+		if (start_is_audio) {
+			// AUDIO refusal: CDS_ERROR causes HQ2 BIOS to retry the same
+			// LBA forever (~36 k retries observed). CDS_PLAYEND mirrors
+			// WinUAE's natural-end notification: BIOS sees "play ended",
+			// treats the requested file as truncated/empty, and walks to
+			// the next directory entry.
+			cd_data_lba_base = -1;
+			r[1] = CDS_PLAYEND | cd_door;
+			akiko_diag("[akiko] PLAY DATA REFUSED audio start_lba=%u (cmd7=0x%02x)",
+			           s_lba, cmd[7]);
+		} else if (start_is_oob) {
+			// OOB refusal: mirror WinUAE exactly (akiko.cpp:1078-1082 for
+			// data plays + 1595 is_valid_data_sector + 1361-1362 skip-push).
+			// WinUAE returns 0x02 (play started) synchronously regardless
+			// of LBA validity, then declines to push PBX bytes for invalid
+			// sectors. BIOS waits for PBX, eventually times out internally,
+			// and re-reads the parent dirent rather than walking the
+			// corrupt linked list.
+			//
+			// Earlier attempt: CDS_PLAYEND synchronously. That works for
+			// AUDIO but creates a tight walk-loop on OOB — BIOS sees
+			// "play ended", abandons, and tries the NEXT corrupt dirent
+			// pointer immediately. Fast-CHD boots stay clean (BIOS never
+			// goes OOB), but slow-CHD boots burn 9 k+ refusals/120 s
+			// without recovery.
+			cd_data_lba_base = -1;
+			r[1] = 0x02;
+			akiko_diag("[akiko] PLAY DATA REFUSED oob start_lba=%u (cmd7=0x%02x) — silent (no PBX, no playend)",
+			           s_lba, cmd[7]);
+		} else {
+			// M4: arm the PBX sector fetcher. cdrom_sector_counter on the FPGA
+			// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
+			// LBA = base + counter holds across the full read pass.
+			cd_data_lba_base = (int32_t)s_lba;
+			r[1] = 0x02;
+			akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x)", (int32_t)s_lba, cmd[7]);
+		}
 	} else if (seek_negative) {
 		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
 		// Start streaming TOC entries to the BIOS one frame at a time.
@@ -1644,6 +1718,57 @@ static void akiko_handle_sec_req(void)
 		return;
 	}
 
+	// Audio-track guard. WinUAE akiko.cpp:1322,1361-1362,1610-1614 sets
+	// sector_buffer_info[i]=0 for non-data sectors via is_valid_data_sector
+	// (control & 0x0c != 4). cdrom_run_read then SKIPS the PBX push (inc=0)
+	// and holds sec_req.
+	//
+	// Without a guard, BIOS reads raw audio bytes from PBX, treats them as
+	// ISO9660 directory data, and uses noise as the next PLAY DATA start
+	// MSF — producing the CR2/HQ2/Microcosm 4-ms retry storm with invalid
+	// BCD bytes (e.g. 0x7C/0x61). 2026-05-08 trace diff: CR2 boots fine
+	// until LBA 37222 (track 2 audio); next CMD has start=0x7C5240E.
+	//
+	// Pure hold (no push, no IRQ) deadlocks BIOS — it never times out,
+	// just waits forever for CDINT_PBX. WinUAE survives this somehow but
+	// our 180s capture confirms our BIOS image does not. Solution: hold
+	// for a short window (~500 ms) then synthesise a "play ended" frame
+	// so BIOS receives the same CDINT_DRIVERECV completion it would get
+	// at lead-out, drops CDFLAG_ENABLE, and moves on. Mirrors the
+	// audiotimeout=-1 -> playend_notify(1) path WinUAE uses for the audio
+	// command end-of-stream.
+	{
+		track_t *track = NULL;
+		for (int i = 0; i < real_tracks; i++) {
+			uint32_t end = drv->track[i].start + drv->track[i].length;
+			if (lba >= drv->track[i].start && lba < end) {
+				track = &drv->track[i];
+				break;
+			}
+		}
+		if (track && !(track->attr & 0x40)) {
+			static uint32_t held_audio_lba = UINT32_MAX;
+			static uint32_t held_count = 0;
+			const uint32_t HOLD_MAX = 50;
+			if (lba != held_audio_lba) {
+				held_audio_lba = lba;
+				held_count = 0;
+				akiko_diag("[akiko] sec_req lba=%u in audio track (attr=0x%02x) — hold",
+				           lba, track->attr);
+			}
+			held_count++;
+			if (held_count >= HOLD_MAX) {
+				akiko_diag("[akiko] audio-hold cap reached at lba=%u — emit playend_notify, disarm",
+				           lba);
+				cd_data_lba_base = -1;
+				emit_playend_notify(1);
+				held_audio_lba = UINT32_MAX;
+				held_count = 0;
+			}
+			return;
+		}
+	}
+
 	int rc = akiko_prefetch_get(drv, lba, buf);
 	if (rc != 0) {
 		// rc == -1: the entire 128-sector batch read failed (CHD/SPI broken)
@@ -1729,25 +1854,28 @@ static void akiko_drain_trace(void)
 
 		if (b3 == 0) break;              // ring drained
 
-		// Phase 33-C: filtered trace — log only writes to control registers
+		// Phase 33-C: filtered trace — log writes to control registers
 		// ($00-$27) so we can see CDFLAG_ENABLE toggles, PBX writes, INTREQ
 		// acks during the sec_req stall. Excludes high-volume cmd buffer
 		// ($18-$1B) and data-DMA addresses to keep log overhead manageable.
-		// Set AKIKO_BUS_TRACE=1 to also see filtered reads.
+		//
+		// v28: also emit READ entries (bit7=0). The RTL already filters
+		// reads to control-register addresses AND only inside the post-CMD
+		// arm window, so userspace can emit them all without flooding.
 		uint8_t  reg_addr = (b0 & 0x7F) << 1;          // word address within $B80000
 		bool     is_wr    = (b0 & 0x80) != 0;
 		bool     is_ctrl  = (reg_addr <= 0x27);        // control registers
 		bool     is_cmd_buf = (reg_addr >= 0x18 && reg_addr <= 0x1B); // very chatty
-		if (is_wr && is_ctrl && !is_cmd_buf) {
-			uint32_t addr = 0xB80000u | reg_addr;
-			uint16_t data = (uint16_t)b1 | ((uint16_t)b2 << 8);
-			akiko_diag("[trace] W $%06X = 0x%04X", addr, data);
+		uint32_t addr = 0xB80000u | reg_addr;
+		uint16_t data = (uint16_t)b1 | ((uint16_t)b2 << 8);
+		if (is_wr) {
+			if (is_ctrl && !is_cmd_buf) {
+				akiko_diag("[trace] W $%06X = 0x%04X", addr, data);
+			}
+		} else {
+			// All read entries that escape the RTL filter are interesting.
+			akiko_diag("[trace] R $%06X -> 0x%04X", addr, data);
 		}
-#if AKIKO_BUS_TRACE
-		(void)0; // (full trace already covered above for writes)
-#else
-		(void)b0; (void)b1; (void)b2;
-#endif
 	}
 
 	DisableIO();

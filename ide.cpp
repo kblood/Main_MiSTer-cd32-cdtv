@@ -21,6 +21,8 @@
 #include "file_io.h"
 #include "hardware.h"
 #include "ide.h"
+#include "ide_cdrom.h"
+#include "support/minimig/akiko_cd32.h"
 
 #if 0
 	#define dbg_printf     printf
@@ -1129,6 +1131,19 @@ int ide_open(uint8_t unit, const char* filename)
 	}
 
 	// close if opened earlier.
+	// Free any leaked chd_file* from a prior cdrom_parse — without this,
+	// drive->chd_f survives ide_img_set(0,0,0), and because the CD-slot
+	// placeholder logic re-asserts drive->cd=1, cd_is_mounted() then
+	// returns true and the akiko bridge keeps reading from the stale
+	// CHD. Visible bug: OSD-unmount + reset re-boots the prior CD.
+	{
+		int port = (unit >> 1) & 1;
+		int drv  = unit & 1;
+		cdrom_close_chd(&ide_inst[port].drive[drv]);
+		// Mirror cdrom_parse's empty-filename behaviour so the akiko
+		// bridge clears its per-game save slot too.
+		if (is_minimig() && unit == 0) akiko_cd32_set_cd_path("");
+	}
 	ide_img_set(unit, 0, 0);
 	FileClose(&hdd_file[unit]);
 	return 0;
