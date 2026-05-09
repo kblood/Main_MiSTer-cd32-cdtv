@@ -800,7 +800,17 @@ static void cmd_multi(const uint8_t *cmd)
 		drive_t *drv2 = cd_find_drive();
 		bool start_is_audio = false;
 		bool start_is_oob   = false;
-		if (drv2) {
+		// seek_negative => s_msf_total < 150, so s_lba underflowed to a huge
+		// uint32 (e.g. msf 00:01:54 → s_lba = 4294967275). The classification
+		// below compares as uint32 and would trip the OOB branch on the wrap,
+		// silently refusing a legitimate pre-gap PLAY DATA. Skip classification
+		// in that case and arm the read with a SIGNED negative cd_data_lba_base;
+		// akiko_handle_sec_req's per-sector signed-LBA path skip-pushes the
+		// pre-gap sectors and serves real data once the counter crosses zero.
+		// (Deep Core 2026-05-09: BIOS issued PLAY DATA at start_lba=4294967275
+		// = -21 and the OOB branch refused it silently. Confirmed in log:
+		// "PLAY DATA REFUSED oob start_lba=4294967275 (cmd7=0x80) — silent".)
+		if (!seek_negative && drv2) {
 			int real_tracks2 = drv2->track_cnt > 0 ? drv2->track_cnt - 1 : 0;
 			uint32_t lead_out2 = (real_tracks2 > 0) ? drv2->track[real_tracks2].start : 0;
 			if (lead_out2 && s_lba >= lead_out2) {
