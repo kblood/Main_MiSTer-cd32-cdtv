@@ -1966,19 +1966,28 @@ void akiko_cd32_set_cd_path(const char *path)
 		return;
 	}
 
-	// Pre-warm Linux page cache for the CHD on a real disc swap. The PBX
+	// Pre-warm Linux page cache for the boot region of the CHD. The PBX
 	// prefetch covers ~99% of in-game accesses, but each cache miss still
 	// costs a USB read (~30 MB/s on USB 2.0). User-observed: a core reset
 	// after first boot makes subsequent boots dramatically faster — that's
-	// the kernel page cache, not our cache. POSIX_FADV_WILLNEED hints the
-	// kernel to start async readahead, so by the time the PBX cache misses
-	// the file pages are already in RAM.
+	// the kernel page cache, not our cache.
+	//
+	// 16 MB is enough to cover ISO9660 PVD/path/dirent (LBAs 16-32) plus
+	// the typical CD32 boot executable region (~20-50 MB into the disc
+	// for most titles). Whole-file readahead (size=0) was tested 2026-05-10
+	// but caused a long black-screen stall on Sim City because the kernel
+	// readahead saturated USB bandwidth during the BIOS init phase. The
+	// 16 MB cap finishes in ~500ms on USB 2.0 — fast enough that it
+	// doesn't compete with the BIOS's own reads. Far-LBA streamers
+	// (Microcosm: deep video data) still benefit because their boot+
+	// menu region is in the warmed window; their late streaming hits
+	// the bridge cache normally.
 	if (path && *path) {
 		int fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd >= 0) {
-			posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+			posix_fadvise(fd, 0, 16 * 1024 * 1024, POSIX_FADV_WILLNEED);
 			close(fd);
-			akiko_diag("[akiko] set_cd_path: fadvise WILLNEED on %s", path);
+			akiko_diag("[akiko] set_cd_path: fadvise WILLNEED 16MB on %s", path);
 		}
 	}
 
