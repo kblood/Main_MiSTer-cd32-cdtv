@@ -21,7 +21,8 @@
 #include <stdbool.h>
 #include <sys/stat.h>     // mkdir() for /media/fat/saves/Minimig
 #include <errno.h>
-#include <unistd.h>       // unlink, fsync
+#include <unistd.h>       // unlink, fsync, close
+#include <fcntl.h>        // open, O_RDONLY, posix_fadvise, POSIX_FADV_WILLNEED
 #include <time.h>         // clock_gettime for akiko_diag timestamp
 #include <byteswap.h>     // bswap_16 for CDDA big-endian → host conversion
 
@@ -210,22 +211,66 @@ static int32_t  cd_data_lba_base    = -1;
 // PBX prefetch cache (mirrors WinUAE akiko.cpp:1589-1658). Without it, every
 // sec_req is a fresh CHD seek + hunk decode (~600us+ per sector). With it, a
 // cache miss reads 128 sectors in a batch and subsequent reads in that window
-// are pure memcpy. cf_boot LBA-16 PVD region and the c_fodder executable
-// region (LBA 25655-25663) used to thrash the on-demand path; the cache
-// converts both into single batch reads.
+// are pure memcpy.
 //
-// 128 * 2352 = 300 KB heap. Static allocation; no malloc.
+// Multi-window LRU. Single-window thrashes on titles that interleave reads
+// from 3+ regions (Sim City alternates LBAs 868/1066/1265 and ran at 39%
+// hit ratio with one window). 4 windows is the sweet spot: Sim City 99%,
+// Microcosm 95%, no regression on sequential readers. Bumping to 8 was
+// tested 2026-05-10 — gave +0.7% on Sim City but cost 1-2% on Microcosm/CF
+// (more thinly-distributed evictions) and didn't fix streamers like Litil
+// Divil (working set >8 regions, mostly read-once). Stay at 4. ~1.18 MiB
+// BSS on the host (1 GB DDR3) is negligible.
 #define AKIKO_PREFETCH_SECTORS 128
-static int32_t cd_prefetch_base_lba = -1;        // first LBA in cache, -1 = empty
-static uint8_t cd_prefetch_buf[AKIKO_PREFETCH_SECTORS * AKIKO_SECTOR_BYTES];
-static uint8_t cd_prefetch_valid[AKIKO_PREFETCH_SECTORS];
+#define AKIKO_PREFETCH_WINDOWS 4
+
+typedef struct {
+	int32_t  base_lba;     // first LBA covered, -1 = empty
+	uint32_t lru_tick;     // higher = more recently used
+	uint8_t  valid[AKIKO_PREFETCH_SECTORS];
+	uint8_t  buf[AKIKO_PREFETCH_SECTORS * AKIKO_SECTOR_BYTES];
+} prefetch_window_t;
+
+static prefetch_window_t cd_prefetch_windows[AKIKO_PREFETCH_WINDOWS];
+static uint32_t cd_prefetch_lru_counter = 0;
 static uint32_t cd_prefetch_hits = 0;
 static uint32_t cd_prefetch_misses = 0;
 static uint32_t cd_prefetch_failed_sectors = 0;
 
 static inline void akiko_prefetch_invalidate(void)
 {
-	cd_prefetch_base_lba = -1;
+	for (int i = 0; i < AKIKO_PREFETCH_WINDOWS; i++) {
+		cd_prefetch_windows[i].base_lba = -1;
+	}
+}
+
+// Returns window index containing lba, or -1 if not cached.
+static int akiko_prefetch_find(uint32_t lba)
+{
+	for (int i = 0; i < AKIKO_PREFETCH_WINDOWS; i++) {
+		const prefetch_window_t *w = &cd_prefetch_windows[i];
+		if (w->base_lba >= 0
+		    && lba >= (uint32_t)w->base_lba
+		    && lba <  (uint32_t)w->base_lba + AKIKO_PREFETCH_SECTORS) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Pick eviction target: empty window if any, else oldest by lru_tick.
+// Wraparound at 4 billion accesses is benign (one comparison flips at the
+// boundary; no correctness impact).
+static int akiko_prefetch_pick_evict(void)
+{
+	int pick = 0;
+	for (int i = 0; i < AKIKO_PREFETCH_WINDOWS; i++) {
+		if (cd_prefetch_windows[i].base_lba < 0) return i;
+		if (cd_prefetch_windows[i].lru_tick < cd_prefetch_windows[pick].lru_tick) {
+			pick = i;
+		}
+	}
+	return pick;
 }
 
 // Audio-play notification state (mirror of WinUAE cdrom_audiotimeout,
@@ -1561,27 +1606,28 @@ static bool akiko_cdda_pump(void)
 	return true;
 }
 
-// Refill the prefetch cache starting at base_lba. Reads up to
-// AKIKO_PREFETCH_SECTORS sectors; per-sector failures mark that slot invalid.
-// Returns number of sectors successfully read; 0 means the entire batch failed.
+// Refill window win_idx starting at base_lba. Reads up to AKIKO_PREFETCH_SECTORS
+// sectors; per-sector failures mark that slot invalid. Returns number of sectors
+// successfully read; 0 means the entire batch failed.
 //
 // Validity is binary (1=valid, 0=read-failed). WinUAE uses a decay counter
-// (init=3, decrement on access) as part of its multi-buffer eviction policy,
-// but since we have a single buffer with on-demand refill, decay would
-// silently break BIOS retry patterns: after 3 accesses to the same LBA the
-// entry would go invalid and stall the read. Keep validity binary instead.
-static int akiko_prefetch_fill(drive_t *drv, uint32_t base_lba)
+// (init=3, decrement on access) as part of its eviction policy, but with our
+// LRU-by-window approach decay would silently break BIOS retry patterns:
+// after 3 accesses to the same LBA the entry would go invalid and stall the
+// read. Keep validity binary; eviction is per-window via lru_tick.
+static int akiko_prefetch_fill(drive_t *drv, int win_idx, uint32_t base_lba)
 {
-	cd_prefetch_base_lba = (int32_t)base_lba;
+	prefetch_window_t *w = &cd_prefetch_windows[win_idx];
+	w->base_lba = (int32_t)base_lba;
 	int filled = 0;
 	for (int i = 0; i < AKIKO_PREFETCH_SECTORS; i++) {
 		uint32_t lba = base_lba + i;
-		uint8_t *slot = &cd_prefetch_buf[i * AKIKO_SECTOR_BYTES];
+		uint8_t *slot = &w->buf[i * AKIKO_SECTOR_BYTES];
 		if (cdrom_read_raw_sector(drv, lba, slot) == 0) {
-			cd_prefetch_valid[i] = 1;
+			w->valid[i] = 1;
 			filled++;
 		} else {
-			cd_prefetch_valid[i] = 0;
+			w->valid[i] = 0;
 			cd_prefetch_failed_sectors++;
 		}
 	}
@@ -1592,43 +1638,42 @@ static int akiko_prefetch_fill(drive_t *drv, uint32_t base_lba)
 // -2 on cached-as-bad. -2 = sector failed to read; caller should skip the PBX
 // push so the FPGA holds sec_req and BIOS retries on the next poll.
 //
-// On miss, if the requested LBA isn't at a 128-sector boundary, retry-reads
-// of just-evicted sectors would be punished. To stay friendly to short
-// backwards seeks (BIOS often re-reads PVD/dirent after data passes), align
-// the fill base to a 128-sector boundary so the cache window is predictable.
+// On miss, evict the LRU window and refill it. The fill base is aligned to a
+// 128-sector boundary so cache windows are predictable and short backwards
+// seeks (BIOS often re-reads PVD/dirent after data passes) stay in-window.
 static int akiko_prefetch_get(drive_t *drv, uint32_t lba, uint8_t *out_buf)
 {
-	bool in_window = (cd_prefetch_base_lba >= 0
-	                  && lba >= (uint32_t)cd_prefetch_base_lba
-	                  && lba <  (uint32_t)cd_prefetch_base_lba + AKIKO_PREFETCH_SECTORS);
-	if (!in_window) {
+	int win = akiko_prefetch_find(lba);
+	if (win < 0) {
 		cd_prefetch_misses++;
+		win = akiko_prefetch_pick_evict();
 		uint32_t base = (lba / AKIKO_PREFETCH_SECTORS) * AKIKO_PREFETCH_SECTORS;
-		if (akiko_prefetch_fill(drv, base) == 0) {
-			akiko_diag("[akiko] prefetch fill TOTAL FAIL at base=%u (req lba=%u)",
-			           base, lba);
+		if (akiko_prefetch_fill(drv, win, base) == 0) {
+			akiko_diag("[akiko] prefetch fill TOTAL FAIL win=%d base=%u (req lba=%u)",
+			           win, base, lba);
 			return -1;
 		}
-		akiko_diag("[akiko] prefetch refill base=%u (req lba=%u hits=%u misses=%u failed=%u)",
-		           base, lba, cd_prefetch_hits, cd_prefetch_misses,
+		akiko_diag("[akiko] prefetch refill win=%d base=%u (req lba=%u hits=%u misses=%u failed=%u)",
+		           win, base, lba, cd_prefetch_hits, cd_prefetch_misses,
 		           cd_prefetch_failed_sectors);
 	} else {
 		cd_prefetch_hits++;
 	}
-	int idx = (int)(lba - (uint32_t)cd_prefetch_base_lba);
-	if (cd_prefetch_valid[idx] == 0) {
+	prefetch_window_t *w = &cd_prefetch_windows[win];
+	w->lru_tick = ++cd_prefetch_lru_counter;
+	int idx = (int)(lba - (uint32_t)w->base_lba);
+	if (w->valid[idx] == 0) {
 		// In-window but flagged bad. Try a single-sector re-read for this
 		// LBA only — transient CHD errors shouldn't permanently poison the
 		// cache slot.
-		uint8_t *slot = &cd_prefetch_buf[idx * AKIKO_SECTOR_BYTES];
+		uint8_t *slot = &w->buf[idx * AKIKO_SECTOR_BYTES];
 		if (cdrom_read_raw_sector(drv, lba, slot) == 0) {
-			cd_prefetch_valid[idx] = 1;
+			w->valid[idx] = 1;
 		} else {
 			return -2;
 		}
 	}
-	memcpy(out_buf, &cd_prefetch_buf[idx * AKIKO_SECTOR_BYTES],
-	       AKIKO_SECTOR_BYTES);
+	memcpy(out_buf, &w->buf[idx * AKIKO_SECTOR_BYTES], AKIKO_SECTOR_BYTES);
 	return 0;
 }
 
@@ -1919,6 +1964,22 @@ void akiko_cd32_set_cd_path(const char *path)
 		// Same hash slot (or both empty) — nothing to do. Either the
 		// user remounted the same CD or this is a pre-init no-op.
 		return;
+	}
+
+	// Pre-warm Linux page cache for the CHD on a real disc swap. The PBX
+	// prefetch covers ~99% of in-game accesses, but each cache miss still
+	// costs a USB read (~30 MB/s on USB 2.0). User-observed: a core reset
+	// after first boot makes subsequent boots dramatically faster — that's
+	// the kernel page cache, not our cache. POSIX_FADV_WILLNEED hints the
+	// kernel to start async readahead, so by the time the PBX cache misses
+	// the file pages are already in RAM.
+	if (path && *path) {
+		int fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+			close(fd);
+			akiko_diag("[akiko] set_cd_path: fadvise WILLNEED on %s", path);
+		}
 	}
 
 	// Flush old save before swap, only if there's a chance writes happened
