@@ -755,6 +755,15 @@ static void cmd_pause(const uint8_t *cmd)
 	} else {
 		r[1] = (cd_playing ? CDS_PLAYING : 0) | cd_door;
 	}
+	// 2026-05-15 WinUAE-parity fix (akiko.cpp:1012): PAUSE stops the TOC
+	// drip immediately. CR2 issues PAUSE while the post-cmd-info scan-TOC
+	// drip is still pushing frames; without this, we keep firing 0x06-
+	// shaped async frames at BIOS during pause, leaving BIOS in a stale
+	// "TOC mode" state that prevents it from re-enabling CDFLAG_ENABLE on
+	// the next PLAY DATA — the bridge then sits with sec_req silent for
+	// 57+ seconds until BIOS times out, by which time the boot has hung.
+	toc_push_idx     = -1;
+	toc_push_last_ms = 0;
 	cd_paused = 1;
 	akiko_send_response(r, 2);
 	akiko_dbg("PAUSE (playing=%d, mounted=%d)\n", cd_playing, cd_is_mounted());
@@ -911,6 +920,15 @@ static void cmd_multi(const uint8_t *cmd)
 			// is reset to 0 on CDFLAG_ENABLE rising (akiko.cpp:1973-1976), so
 			// LBA = base + counter holds across the full read pass.
 			cd_data_lba_base = (int32_t)s_lba;
+			// 2026-05-15 WinUAE-parity fix: cmd_multi at akiko.cpp:1054 sets
+			// cdrom_paused = 0 unconditionally on entry. Our scan-TOC and
+			// audio-play branches do this, but the data branch was missing it.
+			// CR2 fails the sequence scan-TOC → PAUSE → PAUSE → PLAY DATA
+			// because cd_paused stays 1 from the pause; bridge CDDA pump is
+			// gated by it. (The earlier broader patch that also cleared
+			// cd_playing/cd_cdda_lba_next/end broke CR2 by tearing down audio
+			// state — only cd_paused needs flipping here.)
+			cd_paused = 0;
 			r[1] = 0x02;
 			akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x)", (int32_t)s_lba, cmd[7]);
 		}
