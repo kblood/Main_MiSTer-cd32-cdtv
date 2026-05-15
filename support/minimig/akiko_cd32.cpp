@@ -37,6 +37,7 @@
 #include "minimig_config.h"   // minimig_reset() — used to unblock BIOS stuck
                               // on no-CD splash after a boot-with-no-CD-then-mount.
 #include "akiko_cd32.h"
+#include "chipset_trace.h"    // chipset_trace_drain() — gfx-trio debug
 
 // -----------------------------------------------------------------------------
 // Debug gating
@@ -2185,6 +2186,10 @@ void akiko_cd32_poll(void)
 	// Always drain — the ring back-pressures the CPU when full. Per-entry
 	// logging is gated inside the function on AKIKO_BUS_TRACE.
 	akiko_drain_trace();
+
+	// Chipset bus trace (gfx-trio investigation). Always-on drain; when the
+	// agnus.v CHIPSET_TRACE gate is 0 this is a single empty-sentinel poll.
+	chipset_trace_drain();
 
 #if AKIKO_CD32_DEBUG
 	// While we don't think we're mounted, periodically dump the underlying
