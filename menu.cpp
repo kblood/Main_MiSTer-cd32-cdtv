@@ -6155,7 +6155,13 @@ void HandleUI(void)
 		strcat(s, (minimig_config.cpu & 16) ? "ON" : "OFF");
 		OsdWrite(m++, s, menusub == 1, !(minimig_config.cpu & 0x2));
 		strcpy(s, " Turbo    : ");
-		strcat(s, (minimig_config.cpu & 0x20) ? "OFF (A1200)" : "ON");
+		// 3-state from CFG byte bits {5,3,2}:
+		//   bit5=0           -> ON   (forced turbo: chip+kick both fast)
+		//   bit5=1, kick=1   -> 28MHz (A1200 + accelerator: kickstart fast, chip-bus paced)
+		//   bit5=1, kick=0   -> OFF  (stock A1200 14 MHz feel)
+		if (!(minimig_config.cpu & 0x20))      strcat(s, "ON");
+		else if (minimig_config.cpu & 0x08)    strcat(s, "28MHz (Accel.)");
+		else                                    strcat(s, "OFF (A1200)");
 		OsdWrite(m++, s, menusub == 2, !(minimig_config.cpu & 0x2));
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " Chipset  : ");
@@ -6226,12 +6232,20 @@ void HandleUI(void)
 			}
 			else if (menusub == 2 && (minimig_config.cpu & 0x2))
 			{
-				// Turbo toggle (CPU CFG bit 5 — stock-speed gate). When entering
-				// stock mode also clear bits[3:2] so cachecfg's force_turbo
-				// path produces a clean A1200 14 MHz state.
+				// 3-state Turbo cycle through CPU CFG bits {5,3,2}.
+				//   0: ON           bit5=0 (force_turbo: chip+kick both fast)
+				//   1: 28MHz Accel. bit5=1, bit3=1 (turbokick on, turbochip off)
+				//   2: OFF (A1200)  bit5=1, bits[3:2]=00 (no turbo)
+				int state;
+				if (!(minimig_config.cpu & 0x20))      state = 0;
+				else if (minimig_config.cpu & 0x08)    state = 1;
+				else                                    state = 2;
+				if (minus) state = (state == 0) ? 2 : state - 1;
+				else       state = (state == 2) ? 0 : state + 1;
+				minimig_config.cpu &= ~0x2C; // clear bit 5 + bits 3:2
+				if (state == 1) minimig_config.cpu |= 0x28; // bit5 + turbokick
+				else if (state == 2) minimig_config.cpu |= 0x20; // bit5 only
 				menustate = MENU_MINIMIG_CHIPSET1;
-				if (minimig_config.cpu & 0x20) minimig_config.cpu &= ~0x20;
-				else                            minimig_config.cpu = (minimig_config.cpu & ~0x0C) | 0x20;
 				minimig_ConfigCPU(minimig_config.cpu);
 			}
 			else if (menusub == 3)
