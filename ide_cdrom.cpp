@@ -480,8 +480,28 @@ static const char* load_cue_file(drive_t *drv, const char *cuefile)
 			else success = 1;
 			canAddTrack = 0;
 
+			// Try quoted form first: FILE "name with spaces.bin" BINARY
+			// Fall back to whitespace-tokenized name if no opening quote
+			// is found -- some legacy CUE files emit FILE foo.bin BINARY
+			// without quotes when the filename has no spaces.
+			// Don't use get_word() here; it uppercases the token, which
+			// would mangle case-sensitive filenames on Linux.
 			std::string filename;
-			std::getline(std::getline(line, filename, '"'), filename, '"');
+			std::string leading;
+			std::getline(line, leading, '"');
+			if (line.good())
+			{
+				// Leading getline consumed up to the opening quote; read
+				// up to the closing one.
+				std::getline(line, filename, '"');
+			}
+			else
+			{
+				// No quote was present; the leading getline drained the
+				// rest of the line. Re-tokenize on whitespace.
+				std::istringstream toks(leading);
+				toks >> filename;
+			}
 
 			strcpy(track.filename, pathname.c_str());
 			strcat(track.filename, filename.c_str());
