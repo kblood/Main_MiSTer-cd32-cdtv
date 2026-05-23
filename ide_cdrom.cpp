@@ -1011,8 +1011,13 @@ static void pkt_send(ide_config *ide, void *data, uint16_t size)
 
 static void read_cd_sectors(ide_config *ide, track_t *track, int cnt)
 {
-	drive_t *drv = &ide->drive[ide->regs.drv];
-	uint32_t sz = drv->track[drv->data_num].sectorSize;
+	// Use the per-LBA looked-up track's sectorSize/mode2 rather than the
+	// drive-wide drv->data_num picker. For multi-data-track CHD/CUE the
+	// requested LBA can land on a track whose layout differs from the
+	// first/last data track, and reading with the wrong pre/post offsets
+	// here returns mangled bytes. Reads on track->f (already correct)
+	// just needed the matching format metadata.
+	uint32_t sz = track->sectorSize;
 
 	if (sz == 2048)
 	{
@@ -1021,7 +1026,7 @@ static void read_cd_sectors(ide_config *ide, track_t *track, int cnt)
 		return;
 	}
 
-	uint32_t pre = drv->track[drv->data_num].mode2 ? 24 : 16;
+	uint32_t pre = track->mode2 ? 24 : 16;
 	uint32_t post = sz - pre - 2048;
 	uint32_t off = 0;
 
@@ -1067,8 +1072,15 @@ void cdrom_read(ide_config *ide)
 
 	if (drive->chd_f) {
 
-		uint32_t hdr = drive->track[drive->data_num].mode2 ? 24 : 16;
-		if (drive->track[drive->data_num].sectorSize == 2048)
+		// Use the per-LBA track from get_track_from_lba above for mode2,
+		// sectorSize and chd_offset -- not drive->data_num. Same bug class
+		// already fixed in cdrom_read_raw_sector (the native-Akiko PBX path)
+		// for multi-data-track CHDs like Cannon Fodder CD32; this is the
+		// ATAPI-emulator equivalent. For single-data-track discs the
+		// looked-up track IS drive->data_num's track so behavior is
+		// unchanged.
+		uint32_t hdr = track->mode2 ? 24 : 16;
+		if (track->sectorSize == 2048)
 		{
 			hdr = 0;
 		}
@@ -1082,7 +1094,7 @@ void cdrom_read(ide_config *ide)
 		for (uint32_t i = 0; i < cnt; i++)
 		{
 
-			if (mister_chd_read_sector(drive->chd_f, drive->chd_last_partial_lba + drive->track[drive->data_num].chd_offset, d_offset, hdr, 2048, ide_buf, drive->chd_hunkbuf, &drive->chd_hunknum) != CHDERR_NONE)
+			if (mister_chd_read_sector(drive->chd_f, drive->chd_last_partial_lba + track->chd_offset, d_offset, hdr, 2048, ide_buf, drive->chd_hunkbuf, &drive->chd_hunknum) != CHDERR_NONE)
 			{
 				//I don't think anything else uses this, but set it just in case.
 				ide->null = 1;
