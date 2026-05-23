@@ -354,11 +354,17 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	drv->total_sectors = total_sector_size / 512;
 	drv->chd_total_size = total_sector_size;
 
+	// Pick the FIRST data track, matching load_cue_file's picker. The old
+	// loop ran without break and landed on the last data track, so
+	// multi-data-track CHDs (Cannon Fodder CD32) ended up with the wrong
+	// data_num and any code path still keyed off data_num would index the
+	// wrong chd_offset/sectorSize.
 	for (uint8_t i = 0; i < drv->track_cnt; i++)
 	{
 		if (drv->track[i].attr == 0x40)
 		{
 			drv->data_num = i;
+			break;
 		}
 	}
 
