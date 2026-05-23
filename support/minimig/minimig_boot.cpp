@@ -13,6 +13,7 @@
 #include "minimig_config.h"
 #include "minimig_fdd.h"
 #include "akiko_cd32.h"
+#include "cdtv_cd.h"
 #include "../../cfg.h"
 
 static uint8_t buffer[1024];
@@ -431,6 +432,7 @@ void BootInit()
 	// being skipped on every MGL boot. Only the OSD reset combo (Ctrl+Alt+RAlt)
 	// hit the init path. Fix the asymmetry by running it here too.
 	akiko_cd32_init();
+	cdtv_cd_init();
 }
 
 void BootPrintEx(const char * str)

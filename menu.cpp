@@ -179,6 +179,7 @@ enum MENU
 	MENU_MINIMIG_HDFFILE_SELECTED,
 	MENU_MINIMIG_ADFFILE_SELECTED,
 	MENU_MINIMIG_ROMFILE_SELECTED,
+	MENU_MINIMIG_EXTROMFILE_SELECTED,
 	MENU_MINIMIG_LOADCONFIG1,
 	MENU_MINIMIG_LOADCONFIG2,
 	MENU_MINIMIG_SAVECONFIG1,
@@ -6142,46 +6143,37 @@ void HandleUI(void)
 
 	case MENU_MINIMIG_CHIPSET1:
 		helptext_idx = HELPTEXT_CHIPSET;
-		menumask = 0x7FF;
+		menumask = 0x1FFF;
 		OsdSetTitle("System");
 		parentstate = menustate;
 
 		m = 0;
 		OsdWrite(m++, "", 0, 0);
-		strcpy(s, " CPU      : ");
+		strcpy(s, " CPU       : ");
 		strcat(s, config_cpu_msg[minimig_config.cpu & 0x03]);
 		OsdWrite(m++, s, menusub == 0, 0);
-		strcpy(s, " D-Cache  : ");
+		strcpy(s, " D-Cache   : ");
 		strcat(s, (minimig_config.cpu & 16) ? "ON" : "OFF");
 		OsdWrite(m++, s, menusub == 1, !(minimig_config.cpu & 0x2));
-		strcpy(s, " Turbo    : ");
-		// 2-state. CFG byte bit 5 = stock-speed gate. In stock mode the RTL
-		// auto-derives turbokick from whether fast RAM is configured (so a
-		// non-zero FastRAM setting gives the A1200+accelerator 28 MHz feel,
-		// 0 fast RAM gives the bare 14 MHz A1200 feel).
-		if (!(minimig_config.cpu & 0x20)) {
-			strcat(s, "ON");
-		} else {
-			int fast = ((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5);
-			strcat(s, fast ? "OFF (A1200, 28MHz)" : "OFF (A1200, 14MHz)");
-		}
+		strcpy(s, " CPU Speed : ");
+		strcat(s, (minimig_config.cpu & 0x20) ? "14 MHz" : "Full");
 		OsdWrite(m++, s, menusub == 2, !(minimig_config.cpu & 0x2));
 		OsdWrite(m++, "", 0, 0);
-		strcpy(s, " Chipset  : ");
+		strcpy(s, " Chipset   : ");
 		strcat(s, config_chipset_msg[(minimig_config.chipset >> 2) & 7]);
 		OsdWrite(m++, s, menusub == 3, 0);
-		strcpy(s, " ChipRAM  : ");
+		strcpy(s, " ChipRAM   : ");
 		strcat(s, config_memory_chip_msg[minimig_config.memory & 0x03]);
 		OsdWrite(m++, s, menusub == 4, 0);
-		strcpy(s, " FastRAM  : ");
+		strcpy(s, " FastRAM   : ");
 		strcat(s, config_memory_fast_msg[(minimig_config.cpu >> 1) & 1][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
 		OsdWrite(m++, s, menusub == 5, 0);
-		strcpy(s, " SlowRAM  : ");
+		strcpy(s, " SlowRAM   : ");
 		strcat(s, config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]);
 		OsdWrite(m++, s, menusub == 6, 0);
 
 		OsdWrite(m++, "", 0, 0);
-		strcpy(s, " Joystick : ");
+		strcpy(s, " Joystick  : ");
 		strcat(s, config_joystick_mode[(minimig_config.autofire & 6) >> 1]);
 		OsdWrite(m++, s, menusub == 7, 0);
 
@@ -6196,12 +6188,25 @@ void HandleUI(void)
 		}
 
 		OsdWrite(m++, s, menusub == 8, 0);
+		strcpy(s, " Ext.ROM: ");
+		{
+			char *path = HomeDir();
+			int len = strlen(path);
+			const char *name = minimig_get_extrom();
+			if (!name[0]) {
+				strcat(s, "<none>");
+			} else {
+				if (!strncasecmp(name, path, len)) name += len + 1;
+				strncat(&s[3], name, 24);
+			}
+		}
+		OsdWrite(m++, s, menusub == 9, 0);
 		strcpy(s, " HRTmon : ");
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
-		OsdWrite(m++, s, menusub == 9, 0);
+		OsdWrite(m++, s, menusub == 10, 0);
 
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 10, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 11, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -6235,12 +6240,8 @@ void HandleUI(void)
 			}
 			else if (menusub == 2 && (minimig_config.cpu & 0x2))
 			{
-				// Toggle stock-speed gate (CPU CFG bit 5). Also clears legacy
-				// turbochip/turbokick bits [3:2] so the RTL's auto-derive
-				// logic (fast_present -> turbokick) is the sole source of
-				// truth in stock mode.
+				// Toggle stock-speed gate (CPU CFG bit 5).
 				minimig_config.cpu ^= 0x20;
-				minimig_config.cpu &= ~0x0C;
 				menustate = MENU_MINIMIG_CHIPSET1;
 				minimig_ConfigCPU(minimig_config.cpu);
 			}
@@ -6339,10 +6340,24 @@ void HandleUI(void)
 			}
 			else if (menusub == 9)
 			{
+				if (minus)
+				{
+					// Clear Ext.ROM pairing.
+					minimig_set_extrom((char *)"");
+					menustate = MENU_MINIMIG_CHIPSET1;
+				}
+				else if (select)
+				{
+					ioctl_index = 1;
+					SelectFile(Selected_F[5], "ROM", SCANO_DIR, MENU_MINIMIG_EXTROMFILE_SELECTED, MENU_MINIMIG_CHIPSET1);
+				}
+			}
+			else if (menusub == 10)
+			{
 				minimig_config.memory ^= 0x40;
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 10)
+			else if (menusub == 11)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 6;
@@ -6366,32 +6381,60 @@ void HandleUI(void)
 		menustate = MENU_MINIMIG_CHIPSET1;
 		break;
 
+	case MENU_MINIMIG_EXTROMFILE_SELECTED:
+		memcpy(Selected_F[5], selPath, sizeof(Selected_F[5]));
+		minimig_set_extrom(selPath);
+		menustate = MENU_MINIMIG_CHIPSET1;
+		break;
+
 	case MENU_MINIMIG_DISK1:
 		helptext_idx = HELPTEXT_HARDFILE;
 		OsdSetTitle("Drives");
 
 		m = 0;
 		parentstate = menustate;
-		menumask = 0xC01;
-		if (minimig_config.ide_cfg & 1) menumask |= 0x156;
-		OsdWrite(m++, "", 0, 0);
-		strcpy(s, " IDE A600/A1200    : ");
-		strcat(s, (minimig_config.ide_cfg & 1) ? "On " : "Off");
-		OsdWrite(m++, s, menusub == 0, 0);
-		strcpy(s, " Fast-IDE (68020)  : ");
-		strcat(s, (minimig_config.ide_cfg & 0x20) ? "Off" : "On");
-		OsdWrite(m++, s, menusub == 1,  !(minimig_config.ide_cfg & 1) || !(minimig_config.cpu & 2));
-		if (!(minimig_config.cpu & 2)) menumask &= ~2;
-		OsdWrite(m++);
-
 		{
+			int cdtv_on = (minimig_config.chipset & CONFIG_CDTV) ? 1 : 0;
+			int ide_on  = (minimig_config.ide_cfg & 1) ? 1 : 0;
+			int io_on   = ide_on || cdtv_on;
+
+			menumask = 0xC01;
+			if (ide_on)  menumask |= 0x002;  // Fast-IDE row (IDE only)
+			if (io_on)   menumask |= 0x154;  // slot type rows (IDE or CDTV)
+			OsdWrite(m++, "", 0, 0);
+
+			const char *iomode = cdtv_on ? "CDTV" : (ide_on ? "IDE " : "OFF ");
+			strcpy(s, " I/O controller    : ");
+			strcat(s, iomode);
+			OsdWrite(m++, s, menusub == 0, 0);
+
+			strcpy(s, " Fast-IDE (68020)  : ");
+			if (cdtv_on) strcat(s, "N/A");
+			else         strcat(s, (minimig_config.ide_cfg & 0x20) ? "Off" : "On ");
+			OsdWrite(m++, s, menusub == 1, cdtv_on || !ide_on || !(minimig_config.cpu & 2));
+			if (!(minimig_config.cpu & 2)) menumask &= ~2;
+			OsdWrite(m++);
+
 			uint n = 2, t = 8;
 			for (uint i = 0; i < 4; i++)
 			{
-				strcpy(s, (i & 2) ? " Sec. " : " Pri. ");
-				strcat(s, (i & 1) ? " Slave: " : "Master: ");
+				if (cdtv_on)
+				{
+					static const char *cdtv_slot_label[4] = {
+						" CD0           : ",
+						" HD0  (SCSI)   : ",
+						" HD1  (SCSI)   : ",
+						" HD2  (SCSI)   : "
+					};
+					strcpy(s, cdtv_slot_label[i]);
+				}
+				else
+				{
+					strcpy(s, (i & 2) ? " Sec. " : " Pri. ");
+					strcat(s, (i & 1) ? " Slave: " : "Master: ");
+				}
 				strcat(s, (minimig_config.hardfile[i].cfg == 2) ? "Removable/CD" : minimig_config.hardfile[i].cfg ? "Fixed/HDD" : "Disabled");
-				OsdWrite(m++, s, (minimig_config.ide_cfg & 1) ? (menusub == n++) : 0, !(minimig_config.ide_cfg & 1));
+				OsdWrite(m++, s, io_on ? (menusub == n++) : 0, !io_on);
 				if (minimig_config.hardfile[i].filename[0])
 				{
 					strcpy(s, "                                ");
@@ -6405,7 +6448,7 @@ void HandleUI(void)
 				{
 					strcpy(s, "   ** not selected **");
 				}
-				enable = (minimig_config.ide_cfg & 1) && minimig_config.hardfile[i].cfg;
+				enable = io_on && minimig_config.hardfile[i].cfg;
 				if (enable) menumask |= t;	// Make hardfile selectable
 				OsdWrite(m++, s, menusub == n++, enable == 0);
 				t <<= 2;
@@ -6429,15 +6472,40 @@ void HandleUI(void)
 		{
 			if (menusub == 0)
 			{
-				if (select)
+				if (select || minus || plus)
 				{
-					minimig_config.ide_cfg ^= 1;
+					// 3-state I/O controller cycle: OFF -> IDE -> CDTV -> OFF.
+					// Orchestrates both ide_cfg bit 0 (IDE on) and chipset
+					// CONFIG_CDTV (CDTV personality). These are mutually
+					// exclusive: real CDTV has no IDE, and IDE-mode keeps
+					// the chipset out of CDTV bus layout.
+					int cur;
+					if (minimig_config.chipset & CONFIG_CDTV)   cur = 2;
+					else if (minimig_config.ide_cfg & 1)        cur = 1;
+					else                                        cur = 0;
+					int next = minus ? ((cur + 2) % 3) : ((cur + 1) % 3);
+					if (next == 0)
+					{
+						minimig_config.ide_cfg &= ~1;
+						minimig_config.chipset &= ~CONFIG_CDTV;
+					}
+					else if (next == 1)
+					{
+						minimig_config.ide_cfg |= 1;
+						minimig_config.chipset &= ~CONFIG_CDTV;
+					}
+					else
+					{
+						minimig_config.ide_cfg &= ~1;
+						minimig_config.chipset |= CONFIG_CDTV;
+					}
+					minimig_ConfigChipset(minimig_config.chipset);
 					menustate = MENU_MINIMIG_DISK1;
 				}
 			}
 			else if (menusub == 1)
 			{
-				if (select)
+				if (select && !(minimig_config.chipset & CONFIG_CDTV))
 				{
 					minimig_config.ide_cfg ^= 0x20;
 					menustate = MENU_MINIMIG_DISK1;

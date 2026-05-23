@@ -21,6 +21,7 @@
 #include "cd.h"
 #include "ide.h"
 #include "support/minimig/akiko_cd32.h"
+#include "support/minimig/cdtv_cd.h"
 
 #if 0
 #define dbg_printf     printf
@@ -1874,6 +1875,7 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 		ide_inst[num].drive[drv].play_start_lba = 0;
 		ide_inst[num].drive[drv].play_end_lba = 0;
 		akiko_cd32_set_cd_path(full);
+		cdtv_cd_set_cd_path(full);
 		return full;
 	}
 
@@ -1907,6 +1909,7 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	// unmount or on failed load so the bridge clears its active slot.
 	// load_*_file return the image name on success, NULL on failure.
 	akiko_cd32_set_cd_path((path && res) ? path : "");
+	cdtv_cd_set_cd_path((path && res) ? path : "");
 
 	// Remember what we mounted so the next call can short-circuit if it's
 	// the same image (see top of function). Empty/failed mounts clear it

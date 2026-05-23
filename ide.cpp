@@ -23,6 +23,7 @@
 #include "ide.h"
 #include "ide_cdrom.h"
 #include "support/minimig/akiko_cd32.h"
+#include "support/minimig/cdtv_cd.h"
 
 #if 0
 	#define dbg_printf     printf
@@ -1095,7 +1096,16 @@ int ide_open(uint8_t unit, const char* filename)
 	static fileTYPE hdd_file[4] = {};
 	chs_t chs = {};
 
-	if (!is_minimig() || ((minimig_config.ide_cfg & 1) && minimig_config.hardfile[unit].cfg))
+	// CDTV native-mode CD lives on the $E90000 bridge, not Gayle — its CFGs
+	// set ide_cfg=0, but the CHD still has to be opened so the userspace
+	// driver can serve READ TOC/INFO/etc. from it. Allow the mount path when
+	// CDTV mode is active and the slot is configured as a CD (cfg==2).
+	bool cdtv_cd_slot = is_minimig()
+	                 && (minimig_config.chipset & CONFIG_CDTV)
+	                 && minimig_config.hardfile[unit].cfg == 2;
+	if (!is_minimig()
+	    || ((minimig_config.ide_cfg & 1) && minimig_config.hardfile[unit].cfg)
+	    || cdtv_cd_slot)
 	{
 		printf("\nChecking HDD %d\n", unit);
 		if (filename[0] && FileOpenEx(&hdd_file[unit], filename, FileCanWrite(filename) ? O_RDWR : O_RDONLY))
@@ -1143,6 +1153,7 @@ int ide_open(uint8_t unit, const char* filename)
 		// Mirror cdrom_parse's empty-filename behaviour so the akiko
 		// bridge clears its per-game save slot too.
 		if (is_minimig() && unit == 0) akiko_cd32_set_cd_path("");
+		if (is_minimig() && unit == 0) cdtv_cd_set_cd_path("");
 	}
 	ide_img_set(unit, 0, 0);
 	FileClose(&hdd_file[unit]);
