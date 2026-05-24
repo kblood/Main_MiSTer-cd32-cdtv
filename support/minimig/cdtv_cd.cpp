@@ -25,11 +25,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <byteswap.h>     // bswap_16 for CDDA big-endian → host conversion
+
 #include "../../spi.h"
 #include "../../user_io.h"
 #include "../../hardware.h"
 #include "../../ide.h"
 #include "../../ide_cdrom.h"
+#include "../chd/mister_chd.h"    // mister_chd_read_sector for CDDA pump
 #include "cdtv_cd.h"
 #include "minimig_config.h"
 
@@ -74,6 +77,13 @@ static void cdtv_diag(const char *fmt, ...)
 // per entry: 8 LSB-first payload bytes + a valid marker (0xFF=real, 0x00=
 // ring empty). See cdtv_trace.v for the 64-bit entry layout.
 #define CDTV_TRACE_ADDR    0xF880
+// CDDA audio FIFO sub-channel — shared with akiko_cd32.cpp Phase 33.
+// hps_ext.v:191 selects cdda_cs on io_din[15:9] == 7'b1111001 → 0xF200.
+// Each spi_w pushes a 16-bit sample (high byte first for L/R alternation).
+// FIFO depth backpressure shows in the status word as cdda_req (bit 8).
+#define CDTV_CDDA_ADDR     0xF200
+#define CDTV_CDDA_BYTES    2352      // raw red-book audio frame
+#define CDTV_STATUS_CDDA_REQ (1u << 8) // hps_ext.v:218, cdda_req
 #define CDTV_STATUS_CMD    0x63
 #define CDTV_STATUS_REQ    (1u << 6)   // hps_ext.v:197 — cdtv_req
 
@@ -116,6 +126,15 @@ static uint16_t cd_sectorsize  = 2048;
 
 // CD path tracking (from ide_cdrom mount/unmount).
 static char     cd_path_active[1024] = {0};
+
+// CDDA streaming pump state (mirrors akiko_cd32.cpp Phase 33). lba_next
+// is -1 when idle; otherwise it's the next absolute LBA to read and push
+// to UIO 0xF200. lba_end is the exclusive end. cd_paused freezes the pump
+// without tearing the working set down.
+static int32_t  cdtv_play_lba_next = -1;
+static int32_t  cdtv_play_lba_end  = -1;
+static drive_t *cdtv_play_drv      = NULL;
+static uint8_t  cd_paused          = 0;
 
 // Phase-1e: STCH inject retry budget. The cdtv_bridge ilatch is wiped while
 // CPU is held in reset (minimig.v:474 `reset = sys_reset | ~_cpu_reset_in`),
@@ -304,6 +323,133 @@ static void cdtv_push_sector(const uint8_t *buf, int len)
 }
 
 // -----------------------------------------------------------------------------
+// CDDA streaming — same UIO 0xF200 channel as akiko_cd32.cpp Phase 33.
+// rtl/cdda.v is instantiated unconditionally in Minimig.sv and mixed into
+// the audio output, so we don't need a CDTV-specific FPGA hook.
+// -----------------------------------------------------------------------------
+
+// Read one 2352-byte raw audio sector from the CHD into buf. Returns true on
+// success. Validates that lba falls inside an AUDIO track (attr & 0x40 == 0
+// in the ide_cdrom convention, sectorSize == 2352). Mirrors the CD32 path's
+// cd_read_audio_sector — re-implemented here rather than calling
+// cdrom_read_raw_sector because that helper zero-fills audio tracks.
+static bool cdtv_read_audio_sector(drive_t *drv, uint32_t lba, uint8_t *buf2352)
+{
+	if (!drv || !drv->chd_f || !buf2352) return false;
+
+	track_t *track = NULL;
+	int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+	for (int i = 0; i < real_tracks; i++) {
+		uint32_t end = drv->track[i].start + drv->track[i].length;
+		if (lba >= drv->track[i].start && lba < end) {
+			track = &drv->track[i];
+			break;
+		}
+	}
+	if (!track) return false;
+	if (track->attr & 0x40) return false;
+	if (track->sectorSize != CDTV_CDDA_BYTES) return false;
+
+	uint32_t chd_lba = lba + track->chd_offset;
+	if (mister_chd_read_sector(drv->chd_f, chd_lba, 0, 0,
+	                           CDTV_CDDA_BYTES, buf2352,
+	                           drv->chd_hunkbuf, &drv->chd_hunknum)
+	    != CHDERR_NONE) {
+		return false;
+	}
+	return true;
+}
+
+static uint16_t cdtv_read_status_full(void)
+{
+	uint16_t hi;
+	EnableIO();
+	hi = spi_w(CDTV_STATUS_CMD);
+	if (!hi) hi = (uint16_t)spi_w(0);
+	DisableIO();
+	return hi;
+}
+
+static bool cdtv_audio_fifo_ready(void)
+{
+	return (cdtv_read_status_full() & CDTV_STATUS_CDDA_REQ) != 0;
+}
+
+// 2352 bytes = 588 stereo frames × 2 channels × 2 bytes/sample.
+// CHD stores audio big-endian per 16-bit sample; cdda.v wants
+// LEFT first then RIGHT per stereo frame.
+static void cdtv_push_audio_sector(const uint8_t *buf2352)
+{
+	const uint16_t *src = (const uint16_t *)buf2352;
+	const int nframes = CDTV_CDDA_BYTES / 4;
+
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(CDTV_CDDA_ADDR);
+	for (int i = 0; i < nframes; i++) {
+		uint16_t l = bswap_16(src[2 * i + 0]);
+		uint16_t r = bswap_16(src[2 * i + 1]);
+		spi_w(l);
+		spi_w(r);
+	}
+	DisableIO();
+}
+
+// Push one sector if the FIFO has room. Returns true if it pushed.
+static bool cdtv_cdda_pump(void)
+{
+	if (cdtv_play_lba_next < 0) return false;
+	if (cd_paused) return false;
+	if (!cdtv_play_drv) {
+		cdtv_play_lba_next = -1;
+		cdtv_play_lba_end  = -1;
+		return false;
+	}
+	if (!cdtv_audio_fifo_ready()) return false;
+
+	uint8_t buf[CDTV_CDDA_BYTES];
+	uint32_t lba = (uint32_t)cdtv_play_lba_next;
+	if (!cdtv_read_audio_sector(cdtv_play_drv, lba, buf)) {
+		cdtv_dbg("CDDA pump read FAIL at lba=%u — aborting", lba);
+		memset(buf, 0, sizeof(buf));
+		cdtv_push_audio_sector(buf);
+		cdtv_play_lba_next = -1;
+		cdtv_play_lba_end  = -1;
+		cdtv_play_drv      = NULL;
+		cd_playing         = 0;
+		return true;
+	}
+
+	cdtv_push_audio_sector(buf);
+	cdtv_play_lba_next++;
+
+	if ((lba & 0xff) == 0) {
+		cdtv_dbg("CDDA pump lba=%u (rem=%d)", lba,
+		         cdtv_play_lba_end - cdtv_play_lba_next);
+	}
+
+	if (cdtv_play_lba_next >= cdtv_play_lba_end) {
+		cdtv_dbg("CDDA natural end at lba=%u", lba);
+		cdtv_play_lba_next = -1;
+		cdtv_play_lba_end  = -1;
+		cdtv_play_drv      = NULL;
+		cd_playing         = 0;
+		cd_finished        = 1;   // BIOS polls STATUS for play-ended flag
+	}
+	return true;
+}
+
+// MSF (binary M:S:F packed as 0xMMSSFF) → LBA, with 150-frame pre-gap.
+static uint32_t cdtv_msf_to_lba(uint32_t msf)
+{
+	uint32_t m = (msf >> 16) & 0xff;
+	uint32_t s = (msf >>  8) & 0xff;
+	uint32_t f =  msf        & 0xff;
+	uint32_t lsn = (m * 60u + s) * 75u + f;
+	return (lsn >= 150u) ? (lsn - 150u) : 0u;
+}
+
+// -----------------------------------------------------------------------------
 // Command interpreter — mirrors cdtv.cpp:524-695 cdrom_command_thread
 // -----------------------------------------------------------------------------
 
@@ -437,20 +583,117 @@ static void cmd_mode_set(const uint8_t *cmd)
 	}
 }
 
-// PLAY (0x09/0x0a/0x0b). Real audio routing is out of scope for M2; ack with
-// success so BIOS state machine advances. Returns reply byte count.
+// PLAY (0x09 LSN / 0x0a MSF / 0x0b track). Per WinUAE cdtv.cpp:374-412
+// (play_cd) and :328-371 (play_cdtrack):
+//   0x09 LSN:   cmd[1..3] = start LSN, cmd[4..6] = LENGTH in LSNs
+//   0x0a MSF:   cmd[1..3] = start MSF, cmd[4..6] = end MSF
+//   0x0b track: cmd[1]=start trk, cmd[2]=start idx, cmd[3]=end trk, cmd[4]=end idx
+// All resolve to s_lba/e_lba and arm the CDDA pump (poll-side cdtv_cdda_pump
+// pushes one sector per FIFO-ready tick to UIO 0xF200).
+//
+// Returns reply byte count (1 byte status). 0x42 = playing + media.
 static int cmd_play(const uint8_t *cmd, uint8_t *out)
 {
-	(void)cmd;
-	if (cdtv_find_drive() == NULL) {
+	drive_t *drv = cdtv_find_drive();
+	if (!drv || drv->track_cnt < 1) {
 		cd_error = 1;
 		out[0] = 0x00;
 		return -1;
 	}
+
+	uint8_t op = cmd[0];
+	uint32_t s_lba = 0, e_lba = 0;
+	int real_tracks = drv->track_cnt - 1;
+	if (real_tracks < 1) real_tracks = 1;
+
+	if (op == 0x0b) {
+		int track_start = cmd[1];
+		int track_end   = cmd[3];
+		if (track_start == 0 && track_end == 0) {
+			cdtv_dbg("PLAY TRACK 0,0 — stop");
+			cdtv_play_lba_next = -1;
+			cdtv_play_lba_end  = -1;
+			cdtv_play_drv      = NULL;
+			cd_playing = 0;
+			cd_paused  = 0;
+			cd_motor   = 0;
+			cd_error   = 1;
+			out[0] = 0x00;
+			return 1;
+		}
+		bool got_start = false;
+		uint32_t lead_out = drv->track[real_tracks].start;
+		uint32_t s = 0, e = lead_out;
+		for (int i = 0; i < real_tracks; i++) {
+			int trk = i + 1;
+			if (trk == track_start) { s = drv->track[i].start; got_start = true; }
+			if (trk == track_end)   { e = drv->track[i].start; }
+		}
+		if (!got_start) {
+			cdtv_dbg("PLAY TRACK %d-%d: illegal start", track_start, track_end);
+			cd_error = 1;
+			out[0] = 0x00;
+			return 1;
+		}
+		s_lba = s;
+		e_lba = e;
+	} else {
+		uint32_t a = ((uint32_t)cmd[1] << 16) | ((uint32_t)cmd[2] << 8) | cmd[3];
+		uint32_t b = ((uint32_t)cmd[4] << 16) | ((uint32_t)cmd[5] << 8) | cmd[6];
+		if (op == 0x09) {
+			s_lba = a;
+			e_lba = a + b;            // length-in-LSNs → end LBA
+		} else {                       // 0x0a MSF
+			s_lba = cdtv_msf_to_lba(a);
+			e_lba = (b < 0x00ffffff) ? cdtv_msf_to_lba(b) : 0xffffffffu;
+		}
+		uint32_t lead_out = drv->track[real_tracks].start;
+		if (e_lba > lead_out) e_lba = lead_out;
+	}
+
+	if (s_lba == 0 && e_lba == 0) {
+		cdtv_dbg("PLAY stop (0,0)");
+		cdtv_play_lba_next = -1;
+		cdtv_play_lba_end  = -1;
+		cdtv_play_drv      = NULL;
+		cd_playing = 0;
+		cd_paused  = 0;
+		cd_motor   = 0;
+		cd_error   = 1;
+		out[0] = 0x00;
+		return 1;
+	}
+
+	// Validate that the start LBA falls in an audio track. If not, ack as
+	// playing-with-error so the BIOS state machine moves on without
+	// streaming garbage data through the audio mixer.
+	bool start_is_audio = false;
+	for (int i = 0; i < real_tracks; i++) {
+		uint32_t end = drv->track[i].start + drv->track[i].length;
+		if (s_lba >= drv->track[i].start && s_lba < end) {
+			start_is_audio = !(drv->track[i].attr & 0x40);
+			break;
+		}
+	}
+
+	if (start_is_audio && e_lba > s_lba) {
+		cdtv_play_drv      = drv;
+		cdtv_play_lba_next = (int32_t)s_lba;
+		cdtv_play_lba_end  = (int32_t)e_lba;
+		cd_paused = 0;
+		cdtv_dbg("PLAY arm op=%02x s_lba=%u e_lba=%u (n=%u)",
+		         op, s_lba, e_lba, e_lba - s_lba);
+	} else {
+		cdtv_play_drv      = NULL;
+		cdtv_play_lba_next = -1;
+		cdtv_play_lba_end  = -1;
+		cdtv_dbg("PLAY refuse op=%02x s_lba=%u e_lba=%u (audio=%d)",
+		         op, s_lba, e_lba, start_is_audio);
+	}
+
 	cd_playing = 1;
-	cd_motor = 1;
-	// 0x42 = playing + media (mirrors WinUAE cd_finished after play_cd)
-	out[0] = 0x42;
+	cd_motor   = 1;
+	out[0] = 0x42;        // playing + media (WinUAE cdtv.cpp play_cd return)
 	return 1;
 }
 
@@ -566,7 +809,17 @@ static void cdtv_dispatch(void)
 		}
 
 		case 0x04: cd_motor = 1; cd_finished = 1; rlen = 0; break;
-		case 0x05: cd_motor = 0; cd_finished = 1; rlen = 0; break;
+		case 0x05:
+			// Motor off — tear down any in-flight CDDA pump.
+			cdtv_play_lba_next = -1;
+			cdtv_play_lba_end  = -1;
+			cdtv_play_drv      = NULL;
+			cd_playing = 0;
+			cd_paused  = 0;
+			cd_motor   = 0;
+			cd_finished = 1;
+			rlen = 0;
+			break;
 
 		case 0x09: /* play (lsn) */
 		case 0x0a: /* play (msf) */
@@ -663,7 +916,13 @@ static void cdtv_dispatch(void)
 			break;
 		}
 
-		case 0x8b: /* pause/resume */
+		case 0x8b: /* pause / resume */
+			// WinUAE cdtv.cpp:667-672: cmd[1] == 0x00 → pause, else resume.
+			// Pump state is preserved across pause so resume picks up at the
+			// same LBA. cd_playing stays 1 so STATUS poll reflects the
+			// suspended-play state machine.
+			cd_paused = (cmd_buf[1] == 0x00) ? 1 : 0;
+			cdtv_dbg("PAUSE/RESUME cmd1=%02x → paused=%d", cmd_buf[1], cd_paused);
 			cd_finished = 1;
 			rlen = 0;
 			break;
@@ -707,6 +966,11 @@ void cdtv_cd_set_cd_path(const char *path)
 	cd_isready = 0;                    // match WinUAE: bit 0 of STATUS always 1
 	cd_motor   = 0;
 	cd_playing = 0;
+	cd_paused  = 0;
+	// Tear down any in-flight CDDA pump — drive may have vanished.
+	cdtv_play_lba_next = -1;
+	cdtv_play_lba_end  = -1;
+	cdtv_play_drv      = NULL;
 	// WinUAE pattern: every operation completion sets cd_finished=1 (SEEK,
 	// MOTOR ON/OFF, INFO, PAUSE, end-of-DMA all set it). The 0x81 STATUS
 	// handler clears it after reading. So the *first* STATUS after a state
@@ -748,6 +1012,10 @@ void cdtv_cd_init(void)
 	// WinUAE: leave cd_isready=0 so STATUS reply is 0x41 when media present.
 	cd_isready    = 0;
 	cd_playing    = 0;
+	cd_paused     = 0;
+	cdtv_play_lba_next = -1;
+	cdtv_play_lba_end  = -1;
+	cdtv_play_drv      = NULL;
 	// See cdtv_cd_set_cd_path — first STATUS after media-present must show
 	// cd_finished=1 so BIOS sees the 1→0 transition.
 	cd_finished   = cd_media ? 1 : 0;
@@ -774,6 +1042,11 @@ void cdtv_cd_poll(void)
 		stch_retries--;
 		stch_next_ms = GetTimer(STCH_RETRY_PERIOD_MS);
 	}
+
+	// CDDA streaming pump — one sector per FIFO-ready tick. The pump
+	// runs alongside command processing; status reads in cdtv_audio_fifo_ready
+	// share the same SPI cmd 0x63 the CR-511 dispatch already uses.
+	cdtv_cdda_pump();
 
 	// Phase-1g: drain trace ring on every poll so /tmp/cdtv_trace.log
 	// reflects current BIOS bus activity. Each entry is 9 SPI reads.
