@@ -136,6 +136,21 @@ static int32_t  cdtv_play_lba_end  = -1;
 static drive_t *cdtv_play_drv      = NULL;
 static uint8_t  cd_paused          = 0;
 
+// Audio status reported in SUBQ byte 0 (WinUAE cdrom.h AUDIO_STATUS_*):
+//   0x11 IN_PROGRESS    — pump actively streaming
+//   0x12 PAUSED         — pump frozen via 0x8b
+//   0x13 PLAY_COMPLETE  — natural end reached, holds last position
+//   0x14 PLAY_ERROR     — read failure / abort
+//   0x15 NO_STATUS      — idle (never played / stopped)
+// DotC's title-music loop polls 0x87 SUBQ to detect PLAY_COMPLETE and
+// re-arm the cue. With the old stub frozen at IN_PROGRESS+00:00:00 the
+// loop never closed and the title screen stalled.
+static uint8_t  cd_audio_status    = 0x15;
+
+// Last LBA we pumped, preserved across natural-end so SUBQ keeps reporting
+// the right position after the pump tears down.
+static int32_t  cdtv_last_lba      = 0;
+
 // Phase-1e: STCH inject retry budget. The cdtv_bridge ilatch is wiped while
 // CPU is held in reset (minimig.v:474 `reset = sys_reset | ~_cpu_reset_in`),
 // so a single STCH pulse fired during BootInit gets dropped. Worse, BIOS
@@ -413,14 +428,20 @@ static bool cdtv_cdda_pump(void)
 		cdtv_dbg("CDDA pump read FAIL at lba=%u — aborting", lba);
 		memset(buf, 0, sizeof(buf));
 		cdtv_push_audio_sector(buf);
+		cdtv_last_lba      = (int32_t)lba;
 		cdtv_play_lba_next = -1;
 		cdtv_play_lba_end  = -1;
 		cdtv_play_drv      = NULL;
 		cd_playing         = 0;
+		cd_paused          = 0;
+		cd_finished        = 1;
+		cd_audio_status    = 0x14;       // PLAY_ERROR
+		cdtv_inject_stch();
 		return true;
 	}
 
 	cdtv_push_audio_sector(buf);
+	cdtv_last_lba = (int32_t)lba;
 	cdtv_play_lba_next++;
 
 	if ((lba & 0xff) == 0) {
@@ -434,7 +455,14 @@ static bool cdtv_cdda_pump(void)
 		cdtv_play_lba_end  = -1;
 		cdtv_play_drv      = NULL;
 		cd_playing         = 0;
-		cd_finished        = 1;   // BIOS polls STATUS for play-ended flag
+		cd_paused          = 0;
+		cd_finished        = 1;
+		cd_audio_status    = 0x13;       // PLAY_COMPLETE
+		// WinUAE cdtv.cpp:1212-1219: on cd_audio_finished, mirrors the same
+		// state writes AND fires activate_stch=1 — the STCH interrupt is
+		// what wakes the BIOS to notice play-end. SUBQ also flips to
+		// PLAY_COMPLETE so any future loop-detection logic can re-arm.
+		cdtv_inject_stch();
 	}
 	return true;
 }
@@ -453,16 +481,72 @@ static uint32_t cdtv_msf_to_lba(uint32_t msf)
 // Command interpreter — mirrors cdtv.cpp:524-695 cdrom_command_thread
 // -----------------------------------------------------------------------------
 
+// LBA → packed MSF (M in [23:16], S in [15:8], F in [7:0]). The +150 disk
+// offset (pregap before track 1) is the caller's responsibility — track-
+// relative positions don't add it, disk-relative do.
+static uint32_t cdtv_lba2msf(uint32_t lba)
+{
+	uint32_t m = lba / (60u * 75u);
+	uint32_t s = (lba / 75u) % 60u;
+	uint32_t f =  lba % 75u;
+	return (m << 16) | (s << 8) | f;
+}
+
 // Build a SUBQ frame (opcode 0x87). cmd[1] bit 1 selects MSF vs LSN format.
-// Returns reply byte count. For M2 phase-1c we synthesize a minimal "playing
-// audio paused at lba 0" frame — Welcome splash never inspects SUBQ deeply.
+// Mirrors WinUAE cdtv.cpp cdrom_subq() at line 414: byte 0 is audio_status,
+// bytes 2/3 are track/index, bytes 5..7 are disk-position MSF or LSN, bytes
+// 9..11 are track-relative position. Returns 13. DotC's title-music loop
+// polls this every few frames during play and after PLAY_COMPLETE to know
+// when to re-arm the cue and to advance its title-screen state machine.
 static int cmd_subq(const uint8_t *cmd, uint8_t *out)
 {
-	(void)cmd;
+	bool msf = (cmd[1] & 0x02) != 0;
+
 	memset(out, 0, 13);
-	out[0] = cd_playing ? 0x11 : 0x15;    // audio status (15=paused, 11=playing)
-	out[1] = 0x01;                        // track 1
-	out[2] = 0x01;                        // index 1
+	out[0] = cd_audio_status;
+	out[1] = 0x10;     // control=0x1 (audio), addr=0x0 (Q-channel mode 1)
+
+	// Pick the LBA to report: live pump position if playing, else last LBA
+	// pumped (so PLAY_COMPLETE / PAUSED / ERROR keep reporting the right
+	// resting position). Default 0 if we never played.
+	int32_t pump_lba = (cdtv_play_lba_next >= 0) ? cdtv_play_lba_next : cdtv_last_lba;
+	uint32_t disk_lba = (pump_lba > 0) ? (uint32_t)pump_lba : 0;
+
+	// Resolve which track this LBA falls in, using the same track[] that
+	// READ TOC reports. drv->track[last] is the lead-out sentinel.
+	drive_t *drv = cdtv_play_drv ? cdtv_play_drv : cdtv_find_drive();
+	int track_idx = 0;
+	uint32_t track_start = 0;
+	if (drv && drv->track_cnt > 1) {
+		int real_tracks = drv->track_cnt - 1;
+		for (int i = 0; i < real_tracks; i++) {
+			uint32_t s_lba = drv->track[i].start;
+			uint32_t e_lba = s_lba + drv->track[i].length;
+			if (disk_lba >= s_lba && disk_lba < e_lba) {
+				track_idx   = i;
+				track_start = s_lba;
+				break;
+			}
+			// If we never fell into a real track, last partial track wins.
+			track_idx   = i;
+			track_start = s_lba;
+		}
+	}
+
+	out[2] = (uint8_t)(track_idx + 1);   // 1-based track number
+	out[3] = 0x01;                       // post-pregap index
+
+	uint32_t track_lba = (disk_lba > track_start) ? (disk_lba - track_start) : 0;
+	uint32_t disk_pos  = msf ? cdtv_lba2msf(disk_lba + 150) : disk_lba;
+	uint32_t track_pos = msf ? cdtv_lba2msf(track_lba)      : track_lba;
+
+	out[5]  = (disk_pos  >> 16) & 0xff;
+	out[6]  = (disk_pos  >>  8) & 0xff;
+	out[7]  = (disk_pos       ) & 0xff;
+	out[9]  = (track_pos >> 16) & 0xff;
+	out[10] = (track_pos >>  8) & 0xff;
+	out[11] = (track_pos       ) & 0xff;
+
 	return 13;
 }
 
@@ -618,6 +702,7 @@ static int cmd_play(const uint8_t *cmd, uint8_t *out)
 			cd_paused  = 0;
 			cd_motor   = 0;
 			cd_error   = 1;
+			cd_audio_status = 0x15;
 			out[0] = 0x00;
 			return 1;
 		}
@@ -660,6 +745,7 @@ static int cmd_play(const uint8_t *cmd, uint8_t *out)
 		cd_paused  = 0;
 		cd_motor   = 0;
 		cd_error   = 1;
+		cd_audio_status = 0x15;
 		out[0] = 0x00;
 		return 1;
 	}
@@ -680,13 +766,16 @@ static int cmd_play(const uint8_t *cmd, uint8_t *out)
 		cdtv_play_drv      = drv;
 		cdtv_play_lba_next = (int32_t)s_lba;
 		cdtv_play_lba_end  = (int32_t)e_lba;
+		cdtv_last_lba      = (int32_t)s_lba;
 		cd_paused = 0;
+		cd_audio_status    = 0x11;       // IN_PROGRESS
 		cdtv_dbg("PLAY arm op=%02x s_lba=%u e_lba=%u (n=%u)",
 		         op, s_lba, e_lba, e_lba - s_lba);
 	} else {
 		cdtv_play_drv      = NULL;
 		cdtv_play_lba_next = -1;
 		cdtv_play_lba_end  = -1;
+		cd_audio_status    = 0x14;       // PLAY_ERROR (non-audio cue)
 		cdtv_dbg("PLAY refuse op=%02x s_lba=%u e_lba=%u (audio=%d)",
 		         op, s_lba, e_lba, start_is_audio);
 	}
@@ -818,6 +907,7 @@ static void cdtv_dispatch(void)
 			cd_paused  = 0;
 			cd_motor   = 0;
 			cd_finished = 1;
+			cd_audio_status = 0x15;       // NO_STATUS
 			rlen = 0;
 			break;
 
@@ -922,6 +1012,8 @@ static void cdtv_dispatch(void)
 			// same LBA. cd_playing stays 1 so STATUS poll reflects the
 			// suspended-play state machine.
 			cd_paused = (cmd_buf[1] == 0x00) ? 1 : 0;
+			if (cdtv_play_lba_next >= 0)
+				cd_audio_status = cd_paused ? 0x12 : 0x11;
 			cdtv_dbg("PAUSE/RESUME cmd1=%02x → paused=%d", cmd_buf[1], cd_paused);
 			cd_finished = 1;
 			rlen = 0;
@@ -967,6 +1059,8 @@ void cdtv_cd_set_cd_path(const char *path)
 	cd_motor   = 0;
 	cd_playing = 0;
 	cd_paused  = 0;
+	cd_audio_status = 0x15;            // NO_STATUS on disc swap / unmount
+	cdtv_last_lba   = 0;
 	// Tear down any in-flight CDDA pump — drive may have vanished.
 	cdtv_play_lba_next = -1;
 	cdtv_play_lba_end  = -1;
@@ -1013,6 +1107,8 @@ void cdtv_cd_init(void)
 	cd_isready    = 0;
 	cd_playing    = 0;
 	cd_paused     = 0;
+	cd_audio_status = 0x15;             // NO_STATUS on init
+	cdtv_last_lba   = 0;
 	cdtv_play_lba_next = -1;
 	cdtv_play_lba_end  = -1;
 	cdtv_play_drv      = NULL;
