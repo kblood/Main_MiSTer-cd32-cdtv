@@ -102,7 +102,8 @@ bool IPFFile::openFile(const char* filename) {
 	if (!libHandle) return false;
 
 	static char full_path[2100];
-	sprintf(full_path, "%s/%s", getRootDir(), filename);
+	if (filename[0] == '/') snprintf(full_path, sizeof(full_path), "%s", filename);
+	else snprintf(full_path, sizeof(full_path), "%s/%s", getRootDir(), filename);
 
 	SDWORD result = pCAPSLockImage(m_capsImageIndex, (PCHAR)full_path);
 	if (result != imgeOk) {

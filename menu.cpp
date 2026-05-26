@@ -6071,8 +6071,11 @@ void HandleUI(void)
 	case MENU_MINIMIG_ADFFILE_SELECTED:
 		if (!mgl->done)
 		{
-			if (mgl->item[mgl->current].path[0] == '/') snprintf(selPath, sizeof(selPath), "%s", mgl->item[mgl->current].path);
-			else snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), mgl->item[mgl->current].path);
+			// MGL <file path="">: absolute uses path; "../" resolves from storage root; else HomeDir
+			const char *p = mgl->item[mgl->current].path;
+			if (p[0] == '/') snprintf(selPath, sizeof(selPath), "%s", p);
+			else if (p[0] == '.' && p[1] == '.') snprintf(selPath, sizeof(selPath), "%s/%s", getRootDir(), p);
+			else snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), p);
 			// Update /tmp/ files to reflect the actual file being loaded by MGL
 			if (cfg.log_file_entry)
 			{
