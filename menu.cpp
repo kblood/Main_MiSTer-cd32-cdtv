@@ -6237,7 +6237,11 @@ void HandleUI(void)
 			strncat(minimig_config.info, p, sizeof(minimig_config.info) - strlen(minimig_config.info) - 1);
 			minimig_config.info[sizeof(minimig_config.info) - 1] = 0;
 
-			if (menusub<10) minimig_cfg_save(menusub);
+			if (menusub<10)
+			{
+				minimig_cfg_save(menusub);
+				minimig_mgl_save();
+			}
 			menustate = MENU_MINIMIG_MAIN1;
 			menusub = 10;
 		}

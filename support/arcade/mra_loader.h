@@ -53,6 +53,7 @@ struct mgl_struct
 	uint32_t timer;
 	int  state;
 	int  done;
+	char xml_path[1024];
 };
 
 sw_struct *arcade_sw();
