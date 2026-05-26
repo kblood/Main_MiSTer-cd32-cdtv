@@ -64,6 +64,7 @@ extern mm_configTYPE minimig_config;
 
 int minimig_cfg_load(int num);
 int minimig_cfg_save(int num);
+int minimig_mgl_save();
 const char* minimig_get_cfg_info(int num, int label);
 
 void minimig_reset();
