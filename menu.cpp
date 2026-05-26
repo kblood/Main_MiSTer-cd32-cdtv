@@ -6284,7 +6284,6 @@ void HandleUI(void)
 		strcat(s, config_joystick_mode[(minimig_config.autofire & 6) >> 1]);
 		OsdWrite(m++, s, menusub == 7, 0);
 
-		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " ROM    : ");
 		{
 			char *path = HomeDir();
@@ -6311,9 +6310,12 @@ void HandleUI(void)
 		strcpy(s, " HRTmon : ");
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
 		OsdWrite(m++, s, menusub == 10, 0);
+		strcpy(s, " FPU    : ");
+		strcat(s, (minimig_config.cpu & 0x40) ? "ON " : "OFF");
+		OsdWrite(m++, s, menusub == 11, !(minimig_config.cpu & 0x2));
 
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 11, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 12, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -6464,7 +6466,16 @@ void HandleUI(void)
 				minimig_config.memory ^= 0x40;
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 11)
+			else if (menusub == 11 && (minimig_config.cpu & 0x2))
+			{
+				// Toggle FPU runtime gate (CPU CFG bit 6 → feature_cfg(0)).
+				// Only meaningful on 020 (bit 1) AND when the RBF was built
+				// with FPU_Enable=1; on an FPU-pruned RBF this bit is a NOP.
+				minimig_config.cpu ^= 0x40;
+				menustate = MENU_MINIMIG_CHIPSET1;
+				minimig_ConfigCPU(minimig_config.cpu);
+			}
+			else if (menusub == 12)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 8;
