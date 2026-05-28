@@ -38,6 +38,7 @@
                               // on no-CD splash after a boot-with-no-CD-then-mount.
 #include "akiko_cd32.h"
 #include "chipset_trace.h"    // chipset_trace_drain() — gfx-trio debug
+#include "z2_trace.h"         // z2_trace_drain() — 2026-05-27 Z2-hang debug
 
 // -----------------------------------------------------------------------------
 // Debug gating
@@ -140,6 +141,18 @@ static void akiko_diag(const char *fmt, ...);
 //   byte 2: data[15:8]
 //   byte 3: 0xFF if entry valid, 0x00 if ring empty (stop draining)
 #define AKIKO_TRACE_ADDR  0xF480
+
+// 2026-05-28 DDR peek sub-channel: io_din[5] = 1 selects akiko_ddr_peek's
+// ring buffer (bridge→DDR3 writes). 8 bytes per entry:
+//   byte 0: {addr[7:1], 1'b0}
+//   byte 1: addr[15:8]
+//   byte 2: addr[23:16]
+//   byte 3: {U, L, 1'b0, addr[28:24]}
+//   byte 4: data[7:0]
+//   byte 5: data[15:8]
+//   byte 6: 0xA5 sentinel (helps debug if drain alignment slips)
+//   byte 7: 0xFF if valid, 0x00 if ring empty (stop draining)
+#define AKIKO_PEEK_ADDR  0xF420
 
 // PBX sector size (raw Mode-1/Mode-2 frame).
 #define AKIKO_SECTOR_BYTES 2352
@@ -517,6 +530,42 @@ static int akiko_drain_command(uint8_t *buf)
 	return total;
 }
 
+// 2026-05-28: drain the akiko_ddr_peek ring (bridge→DDR3 writes). One entry
+// is 8 bytes, last byte 0x00 marks ring-empty. Each entry is decoded into
+// (addr[28:0], U, L, data) and logged via akiko_diag. Used to verify that
+// the bytes userspace pushes via UIO_DMA_WRITE actually land in DDR3 at the
+// expected Z2 addresses with the expected data.
+#if AKIKO_Z2_TRACE
+static int akiko_ddr_peek_drain_and_log(const char *tag)
+{
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(AKIKO_PEEK_ADDR);
+	int count = 0;
+	for (int safety = 0; safety < 64; safety++) {
+		uint8_t b[8];
+		for (int i = 0; i < 8; i++) b[i] = (uint8_t)spi_w(0);
+		if (b[7] == 0x00) break;        // ring empty
+		uint32_t addr =  (uint32_t)b[0]
+		              | ((uint32_t)b[1] << 8)
+		              | ((uint32_t)b[2] << 16)
+		              | (((uint32_t)(b[3] & 0x1F)) << 24);
+		uint8_t  u    = (b[3] >> 7) & 1;
+		uint8_t  l    = (b[3] >> 6) & 1;
+		uint16_t data = (uint16_t)b[4] | ((uint16_t)b[5] << 8);
+		akiko_diag("[akiko] DDR-peek %s[%d]: addr=$%08x UL=%d%d data=$%04x%s",
+		           tag, count, addr, u, l, data,
+		           (b[6] != 0xA5) ? " (BAD SENTINEL)" : "");
+		count++;
+	}
+	DisableIO();
+	if (count == 0) {
+		akiko_diag("[akiko] DDR-peek %s: ring empty (no bridge writes captured)", tag);
+	}
+	return count;
+}
+#endif  // AKIKO_Z2_TRACE
+
 // Append the trailing one-byte checksum (akiko.cpp:838-842) and push the whole
 // payload to the FPGA via UIO_DMA_WRITE. The FPGA's RX engine DMAs the bytes
 // to chip RAM and asserts the CD32 IRQ when result_done strobes.
@@ -549,7 +598,44 @@ static void akiko_send_response(const uint8_t *payload, int len)
 	// can return rx_busy=0 (stale), and the gating logic for auto-init /
 	// TOC drip / NVR save would push another response on top of this one.
 	// Bounded to 200 iters (~200µs of SPI reads); typical case is 1-3.
+	//
+#if AKIKO_Z2_TRACE
+	// 2026-05-27 Z2 hang diag: count iters and log whether rx_busy was
+	// observed. If rx_busy never rose, either the SPI push didn't trigger
+	// result_done in akiko_hps_bridge, or the RX engine isn't draining
+	// our payload into chip RAM (Z2-mode hang suspect).
+	int wait_iters = 0;
+	bool rx_seen = false;
+	for (; wait_iters < 200; wait_iters++) {
+		uint16_t s = akiko_read_status();
+		if (s & AKIKO_STATUS_RX_BUSY) { rx_seen = true; break; }
+	}
+	// 2026-05-27 Z2 hang diag (v2): also poll for rx_busy to CLEAR — proves the
+	// FPGA RX engine actually drained the result_buffer into chip RAM via
+	// chipdma_arb's bridge-write path. If rx_busy stays set forever, RX is
+	// stuck (bridge writes to Z2 cdrx_address not completing).
+	int drain_iters = 0;
+	bool rx_drained = false;
+	if (rx_seen) {
+		for (; drain_iters < 50000; drain_iters++) {
+			uint16_t s = akiko_read_status();
+			if (!(s & AKIKO_STATUS_RX_BUSY)) { rx_drained = true; break; }
+		}
+	}
+	akiko_diag("[akiko] SEND op=0x%02x len=%d rx_busy=%s iters=%d drain=%s drain_iters=%d",
+	           out[0] & 0x0F, len, rx_seen ? "set" : "TIMEOUT", wait_iters,
+	           rx_drained ? "ok" : "STUCK", drain_iters);
+
+	// 2026-05-28: drain the DDR-peek ring after the RX engine claims it
+	// finished writing to Z2. Only log for op=0x07 (INFO) — that's the
+	// frame the CD32 BIOS hangs on after parsing the CMD. Other opcodes
+	// would just spam the log without informing the hypothesis.
+	if ((out[0] & 0x0F) == 0x07) {
+		akiko_ddr_peek_drain_and_log("INFO-RX");
+	}
+#else
 	akiko_wait_status_bit(AKIKO_STATUS_RX_BUSY, true, 200);
+#endif  // AKIKO_Z2_TRACE
 
 #if AKIKO_CD32_DEBUG
 	akiko_dbg("TX %d bytes:", total);
@@ -2190,6 +2276,14 @@ void akiko_cd32_poll(void)
 	// Chipset bus trace (gfx-trio investigation). Always-on drain; when the
 	// agnus.v CHIPSET_TRACE gate is 0 this is a single empty-sentinel poll.
 	chipset_trace_drain();
+
+	// 2026-05-27 Z2-hang trace ring drain. Gated on AKIKO_Z2_TRACE (z2_trace.h);
+	// release builds compile this out so /tmp/z2_trace.csv is never created and
+	// the per-poll UIO drain disappears. Re-enable alongside the RTL ring
+	// (build_minimig.ps1 -Z2Trace) when investigating Z2 fast-RAM hangs.
+#if AKIKO_Z2_TRACE
+	z2_trace_drain();
+#endif
 
 #if AKIKO_CD32_DEBUG
 	// While we don't think we're mounted, periodically dump the underlying
