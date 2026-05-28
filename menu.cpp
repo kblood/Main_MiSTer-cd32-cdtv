@@ -6357,7 +6357,7 @@ void HandleUI(void)
 				else if (select)
 				{
 					ioctl_index = 1;
-					SelectFile(Selected_F[5], "ROM", SCANO_DIR, MENU_MINIMIG_EXTROMFILE_SELECTED, MENU_MINIMIG_CHIPSET1);
+					SelectFile(Selected_F[5], "ROM", SCANO_DIR | SCANO_UMOUNT, MENU_MINIMIG_EXTROMFILE_SELECTED, MENU_MINIMIG_CHIPSET1);
 				}
 			}
 			else if (menusub == 10)
