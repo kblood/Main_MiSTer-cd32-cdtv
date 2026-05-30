@@ -102,6 +102,15 @@ static void akiko_diag(const char *fmt, ...);
 // sector channel (hps_ext.v:135, akiko_cs_sec). 0xF400 | 0x100 = 0xF500.
 #define AKIKO_SECTOR_ADDR  0xF500
 
+// Subcode push sub-channel (io_din[4] = 1 -> akiko_cs_subcode in hps_ext.v).
+// 0xF400 | 0x10 = 0xF410. Write-only: Main pushes one 96-byte INTERLEAVED P-W
+// subchannel block per CD frame during CDDA play; the FPGA DMAs it to
+// (addressmisc|0x100) and raises CDINT_SUBCODE (gated on CDFLAG_SUBCODE). See
+// research/docs/subcode-streaming-design-2026-05-30.md.
+#define AKIKO_SUBCODE_ADDR 0xF410
+#define AKIKO_SUB_ENTRY    12     // SUB_ENTRY_SIZE (one subchannel = 12 bytes)
+#define AKIKO_SUB_BYTES    96     // SUB_CHANNEL_SIZE (8 channels x 12)
+
 // Phase 32: NVRAM save-dump sub-channel. io_din[6] = 1 selects the NVRAM
 // host port (akiko_hps_bridge.v + akiko_nvram.v). 0xF400 | 0x40 = 0xF440.
 // Reading streams 1024 bytes (auto-incrementing internal addr counter,
@@ -314,6 +323,8 @@ static uint32_t cd_audio_play_until_ms = 0;
 //                      NULL = idle.
 // All three are kept in lockstep — set together in cmd_multi and cleared
 // together in cmd_stop / pump natural-end / failure paths.
+static int32_t cd_cdda_q_pos    = -1;   // SUBQ: last sector played (survives natural end)
+static int32_t cd_cdda_q_end    = -1;   // SUBQ: play-end LBA for WinUAE end-clamp
 static int32_t cd_cdda_lba_next = -1;
 static int32_t cd_cdda_lba_end  = -1;
 static drive_t *cd_cdda_drv     = NULL;
@@ -1075,15 +1086,39 @@ static void cmd_multi(const uint8_t *cmd)
 		}
 
 		if (valid) {
+			// Idempotent re-PLAY guard (Liberation/Captive II, Deep Core
+			// 2026-05-30): these titles poll PAUSE (op=0x02) then re-issue an
+			// IDENTICAL PLAY AUDIO (op=0x04) every ~0.88 s. Unconditionally
+			// re-arming cd_cdda_lba_next to s_lba rewound the pump to the track
+			// start each poll, so the track never advanced (looping music). If
+			// a play is already in progress for the same drive+range and the
+			// pump position is still inside [s_lba,e_lba), leave cd_cdda_lba_next
+			// alone so playback continues; only re-arm on a new/idle range.
+			bool same_range_inflight =
+				(cd_cdda_drv == drv) &&
+				(cd_cdda_lba_end == (int32_t)e_lba) &&
+				(cd_cdda_lba_next >= (int32_t)s_lba) &&
+				(cd_cdda_lba_next <  (int32_t)e_lba);
 			cd_cdda_drv      = drv;
-			cd_cdda_lba_next = (int32_t)s_lba;
-			cd_cdda_lba_end  = (int32_t)e_lba;
+			if (!same_range_inflight) {
+				cd_cdda_lba_next = (int32_t)s_lba;
+				cd_cdda_lba_end  = (int32_t)e_lba;
+				cd_cdda_q_pos    = (int32_t)s_lba;
+			}
+			cd_cdda_q_end = (int32_t)e_lba;
 			// Wall-clock fallback no longer needed — pump fires playend
 			// from natural-end detection on its own. Leave armed at 0.
 			cd_audio_play_until_ms = 0;
-			akiko_dbg("CDDA arm s=%u e=%u\n", s_lba, e_lba);
-			akiko_diag("[akiko] CDDA arm: s_lba=%u e_lba=%u (drv=%p)",
-			           s_lba, e_lba, (void*)drv);
+			if (same_range_inflight) {
+				akiko_dbg("CDDA re-PLAY same range s=%u e=%u next=%d kept\n",
+				          s_lba, e_lba, cd_cdda_lba_next);
+				akiko_diag("[akiko] CDDA re-PLAY same range s_lba=%u e_lba=%u next=%d (position kept)",
+				           s_lba, e_lba, cd_cdda_lba_next);
+			} else {
+				akiko_dbg("CDDA arm s=%u e=%u\n", s_lba, e_lba);
+				akiko_diag("[akiko] CDDA arm: s_lba=%u e_lba=%u (drv=%p)",
+				           s_lba, e_lba, (void*)drv);
+			}
 		} else {
 			// Bad range or wrong track type — schedule asynchronous
 			// failure notify. The synchronous 0x42 ack is already in r[]
@@ -1160,13 +1195,18 @@ static void cmd_subq(const uint8_t *cmd)
 			// Active data read: counter gives offset within the burst.
 			cur_lba = (uint32_t)cd_data_lba_base + akiko_read_sec_counter();
 			valid = true;
-		} else if (cd_playing && cd_cdda_lba_next > 0) {
+		} else if (cd_playing && cd_cdda_q_pos >= 0) {
 			// Audio play (Phase 33): pump tracks the next-to-push LBA.
 			// Report the position of the sector we *just* pushed
 			// (cd_cdda_lba_next - 1) so qcode advances frame-by-frame
 			// across the play range. WinUAE's qcode comes from the audio
 			// renderer's frame counter — same effect.
-			cur_lba = (uint32_t)(cd_cdda_lba_next - 1);
+			cur_lba = (uint32_t)cd_cdda_q_pos;
+			// WinUAE akiko.cpp:742-750 "end of disc position is not missed":
+			// within ~10 frames of the play end, clamp to the exact end so a
+			// game polling SUBQ for end-of-audio (DotC) actually sees it.
+			if (cd_cdda_q_end > 0 && (cd_cdda_q_end - (int32_t)cur_lba) < 10)
+				cur_lba = (uint32_t)cd_cdda_q_end;
 			valid = true;
 		} else if (cd_playing && cd_play_start_lba > 0) {
 			// Pump idle but cd_playing still set (e.g. mid-pump-arm
@@ -1652,6 +1692,69 @@ static void akiko_push_audio_sector(const uint8_t *buf2352)
 	DisableIO();
 }
 
+// Build the deinterleaved 96-byte subchannel for `lba`: all zero except the
+// Q channel (bytes 12..23), per WinUAE getsub regenerate
+// (blkdev_cdimage.cpp:336). Track-relative MSF carries no pre-gap; absolute
+// MSF includes the 2-second (150-frame) pre-gap, matching lsn2msf().
+static void build_subcode_deint(drive_t *drv, uint32_t lba, uint8_t out[AKIKO_SUB_BYTES])
+{
+	memset(out, 0, AKIKO_SUB_BYTES);
+	if (!drv) return;
+
+	int trk_idx = 0;
+	int real_tracks = drv->track_cnt > 0 ? drv->track_cnt - 1 : 0;
+	for (int i = 0; i < real_tracks; i++) {
+		uint32_t end = (i + 1 < drv->track_cnt) ? drv->track[i + 1].start
+		                                        : drv->track[i].start + drv->track[i].length;
+		if (lba >= drv->track[i].start && lba < end) { trk_idx = i; break; }
+	}
+	const track_t &t = drv->track[trk_idx];
+
+	uint8_t *q = out + AKIKO_SUB_ENTRY;       // Q channel at byte offset 12
+	q[0] = (uint8_t)((t.attr & 0xf0) | 0x01); // ctrl nibble | adr=1
+	q[1] = bin_to_bcd((uint8_t)t.number);     // track number (1-based)
+	q[2] = bin_to_bcd(1);                     // index 1
+
+	uint32_t rel = (lba >= t.start) ? (lba - t.start) : 0u; // track-rel, no pregap
+	q[3] = bin_to_bcd((uint8_t)((rel / 75u) / 60u));
+	q[4] = bin_to_bcd((uint8_t)((rel / 75u) % 60u));
+	q[5] = bin_to_bcd((uint8_t)( rel % 75u));
+	q[6] = 0;
+
+	uint32_t ab = lba + 150u;                 // absolute, +2s pregap (lsn2msf)
+	q[7] = bin_to_bcd((uint8_t)((ab / 75u) / 60u));
+	q[8] = bin_to_bcd((uint8_t)((ab / 75u) % 60u));
+	q[9] = bin_to_bcd((uint8_t)( ab % 75u));
+	// q[10],q[11] = CRC, left zero (WinUAE leaves them 0 on the regen path)
+}
+
+// WinUAE sub_to_interleaved (blkdev_cdimage.cpp:280): deinterleaved 8x12
+// channel layout -> bit-interleaved 96-byte raw subchannel.
+static void sub_to_interleaved(const uint8_t *s, uint8_t *d)
+{
+	for (int i = 0; i < AKIKO_SUB_BYTES; i++) {
+		int dmask = 0x80;
+		int smask = 1 << (7 - (i & 7));
+		d[i] = 0;
+		for (int j = 0; j < 8; j++) {
+			if (s[(i / 8) + j * AKIKO_SUB_ENTRY] & smask) d[i] |= dmask;
+			dmask >>= 1;
+		}
+	}
+}
+
+// Push one 96-byte INTERLEAVED subchannel block over the subcode UIO channel.
+// The FPGA stages it and (if CDFLAG_SUBCODE is set) DMAs it to the game's
+// subcode buffer + raises CDINT_SUBCODE. Mirrors akiko_push_sector's slow path.
+static void akiko_push_subcode(const uint8_t *d96)
+{
+	EnableIO();
+	spi8(UIO_DMA_WRITE);
+	spi32_w(AKIKO_SUBCODE_ADDR);
+	for (int i = 0; i < AKIKO_SUB_BYTES; i++) spi_w(d96[i]);
+	DisableIO();
+}
+
 // Pump tick: if a CDDA play is armed and the FIFO has room, push exactly
 // one sector. Returns true if it pushed (caller treats as one bridge
 // action consumed and returns from poll). Handles natural end-of-play
@@ -1689,6 +1792,19 @@ static bool akiko_cdda_pump(void)
 
 	akiko_push_audio_sector(buf);
 	cd_cdda_lba_next++;
+	cd_cdda_q_pos = (int32_t)lba;          // SUBQ reports the sector just played
+
+	// CDDA position heartbeat: stream the Q-subchannel for the sector we just
+	// played. The FPGA only DMAs/IRQs it when the game set CDFLAG_SUBCODE, so
+	// non-subcode titles are unaffected. Without this, games that arm the
+	// SUBCODE interrupt (Liberation, Deep Core) re-cue the music every ~0.9 s.
+	{
+		uint8_t sub_deint[AKIKO_SUB_BYTES];
+		uint8_t sub_intlv[AKIKO_SUB_BYTES];
+		build_subcode_deint(cd_cdda_drv, lba, sub_deint);
+		sub_to_interleaved(sub_deint, sub_intlv);
+		akiko_push_subcode(sub_intlv);
+	}
 
 	if ((lba & 0xff) == 0) {
 		int32_t remaining = cd_cdda_lba_end - cd_cdda_lba_next;
@@ -1699,6 +1815,10 @@ static bool akiko_cdda_pump(void)
 	if (cd_cdda_lba_next >= cd_cdda_lba_end) {
 		akiko_dbg("CDDA done at lba=%u\n", lba);
 		akiko_diag("[akiko] CDDA pump natural end at lba=%u", lba);
+		// WinUAE cd_qcode parity: report the exact play-end so a SUBQ-polling
+		// game (DotC) sees end-of-audio; q_end kept for the clamp, cd_playing
+		// stays 1 so cmd_subq still answers.
+		cd_cdda_q_pos    = cd_cdda_q_end;
 		cd_cdda_lba_next = -1;
 		cd_cdda_lba_end  = -1;
 		cd_cdda_drv      = NULL;
