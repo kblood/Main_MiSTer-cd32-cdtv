@@ -463,6 +463,14 @@ static bool cdtv_cdda_pump(void)
 		// what wakes the BIOS to notice play-end. SUBQ also flips to
 		// PLAY_COMPLETE so any future loop-detection logic can re-arm.
 		cdtv_inject_stch();
+		// Phase-1h EXPERIMENT: WinUAE shows DotC issues a SECOND CDDA PLAY
+		// (lba 9825-12075) ~17 s AFTER this first audio ends. A single
+		// end-of-play STCH wasn't enough; re-arm a SUSTAINED STCH heartbeat
+		// that outlasts that 17 s gap so the cd.device worker keeps getting
+		// status-change pokes until the game advances. Self-terminates in
+		// cdtv_dispatch() the moment the game issues any non-STATUS command.
+		stch_retries = 240;                       // ~60 s @ 250 ms
+		stch_next_ms = GetTimer(STCH_RETRY_PERIOD_MS);
 	}
 	return true;
 }
