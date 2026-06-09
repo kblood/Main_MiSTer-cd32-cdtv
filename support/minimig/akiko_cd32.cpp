@@ -163,6 +163,13 @@ static void akiko_diag(const char *fmt, ...);
 //   byte 7: 0xFF if valid, 0x00 if ring empty (stop draining)
 #define AKIKO_PEEK_ADDR  0xF420
 
+// DEBUG counter-drain sub-channel (Deep Core garble localization, 2026-06-05).
+// UIO class 0xF400 with io_din[3]=1. Drain returns a fixed 13-byte payload:
+// [0]=0xC5 magic, then little-endian dbg_fill_sum, dbg_commit_cnt, dbg_commit_sum
+// (the FPGA's per-sector fill checksum and authoritative SDRAM chip-commit
+// count + byte-sum). See rtl/hps_ext.v + rtl/sdram_ctrl.v.
+#define AKIKO_DBG_ADDR   0xF408
+
 // PBX sector size (raw Mode-1/Mode-2 frame).
 #define AKIKO_SECTOR_BYTES 2352
 
@@ -1028,7 +1035,13 @@ static void cmd_multi(const uint8_t *cmd)
 			// state — only cd_paused needs flipping here.)
 			cd_paused = 0;
 			r[1] = 0x02;
-			akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x)", (int32_t)s_lba, cmd[7]);
+			// 2026-06-05 Deep Core counter-drift diagnostic: log the FPGA
+			// cdrom_sector_counter AT ARM TIME. If the BIOS issues successive
+			// READ DATA without re-pulsing CDFLAG_ENABLE, the counter is NOT
+			// reset between reads, so LBA=base+counter delivers base+leftover
+			// (wrong sector) — deterministic, matches the read-#3 divergence.
+			akiko_diag("[akiko] PLAY DATA arm: start_lba=%d (cmd7=0x%02x) fpga_ctr@arm=%u",
+			           (int32_t)s_lba, cmd[7], akiko_read_sec_counter());
 		}
 	} else if (seek_negative) {
 		// PLAY with seekpos < 0 = "scan TOC" trigger (akiko.cpp:1095-1097).
@@ -1902,6 +1915,81 @@ static int akiko_prefetch_get(drive_t *drv, uint32_t lba, uint8_t *out_buf)
 	return 0;
 }
 
+// DEBUG counter readback (Deep Core garble localization, 2026-06-05). Reads the
+// 13-byte drain on AKIKO_DBG_ADDR and parses the 0xC5-magic-prefixed payload
+// (robust to a 1-byte SPI read-alignment slip). Returns false if the magic
+// isn't found — e.g. the running RBF predates the debug channel.
+static bool akiko_read_dbg_counters(uint32_t *fill, uint32_t *cnt, uint32_t *sum)
+{
+	uint8_t raw[24];
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(AKIKO_DBG_ADDR);
+	for (int i = 0; i < (int)sizeof(raw); i++) raw[i] = (uint8_t)spi_w(0);
+	DisableIO();
+	for (int i = 0; i + 12 < (int)sizeof(raw); i++) {
+		if (raw[i] == 0xC5) {
+			const uint8_t *p = &raw[i + 1];
+			*fill = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+			*cnt  = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+			*sum  = (uint32_t)p[8] | ((uint32_t)p[9] << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
+			return true;
+		}
+	}
+	return false;
+}
+
+// DEBUG per-sector commit verifier (Deep Core, 2026-06-05). The FPGA's fill and
+// commit shadows latch one sector behind (fill at sector_ready, commit at
+// PBX_FIN), so each call reads them for the PREVIOUS real sector pushed and
+// compares to the expectation stashed for it, then stashes THIS sector's
+// expectation. Decisive split:
+//   cnt   != 2352            -> PBX DATA byte(s) never committed to chip SDRAM:
+//                               a downstream drop the arbiter's self-ack hides.
+//   fill  != raw-sum         -> fast fill captured the sector wrong (M1).
+//   commit_core != data-sum  -> wrong byte values reached chip RAM (M2 data).
+//   all OK but game WILD      -> corruption is in the CPU read / coherency path.
+// commit_core removes the modeled PBX byte-0..3 transform (0,0,0,counter&31)
+// from the FPGA commit sum so it can be compared to the raw data region.
+static void akiko_dbg_check_and_stash(const uint8_t *buf, uint8_t counter, uint32_t lba)
+{
+	static bool     have_prev = false;
+	static uint32_t prev_fill = 0, prev_commit_core = 0, prev_lba = 0;
+	static uint8_t  prev_counter = 0;
+	static uint32_t dbg_seq = 0;
+
+	uint32_t fill = 0, cnt = 0, sum = 0;
+	bool ok = akiko_read_dbg_counters(&fill, &cnt, &sum);
+	if (ok && have_prev) {
+		long long commit_core = (long long)sum - (long long)(prev_counter & 0x1f);
+		bool fill_bad   = (fill != prev_fill);
+		bool cnt_bad    = (cnt  != AKIKO_SECTOR_BYTES);
+		bool commit_bad = (commit_core != (long long)prev_commit_core);
+		bool bad = fill_bad || cnt_bad || commit_bad;
+		if (bad || (dbg_seq & 0xff) == 0) {
+			akiko_diag("[akiko][dbg] lba=%u fill exp=%u got=%u%s | commit cnt=%u(exp %u)%s "
+			           "sum=%u core=%lld exp=%u%s%s",
+			           prev_lba, prev_fill, fill, fill_bad ? " FILL_MISMATCH" : "",
+			           cnt, AKIKO_SECTOR_BYTES, cnt_bad ? " CNT_DROP" : "",
+			           sum, commit_core, prev_commit_core, commit_bad ? " COMMIT_MISMATCH" : "",
+			           bad ? "" : " OK");
+		}
+		dbg_seq++;
+	} else if (!ok) {
+		static bool warned = false;
+		if (!warned) {
+			akiko_diag("[akiko][dbg] counter-drain magic not found (RBF lacks the debug channel?)");
+			warned = true;
+		}
+	}
+
+	uint32_t f = 0, c = 0;
+	for (int i = 0; i < AKIKO_SECTOR_BYTES; i++) f += buf[i];
+	for (int i = 4; i < AKIKO_SECTOR_BYTES; i++) c += buf[i];
+	prev_fill = f; prev_commit_core = c; prev_counter = counter; prev_lba = lba;
+	have_prev = true;
+}
+
 // Service one akiko_sec_req. Reads the engine's current sector_counter,
 // fetches LBA = base + counter from the CD image, and pushes the raw 2352-byte
 // frame back. On any error (no disc, no data read armed, image read failure)
@@ -1964,6 +2052,17 @@ static void akiko_handle_sec_req(void)
 	// first real sector. Per-sector handling silences only the genuinely-
 	// negative LBAs and serves CHD data once we cross zero.
 	int32_t signed_lba = cd_data_lba_base + (int32_t)counter;
+	// 2026-06-05 Deep Core counter-drift diagnostic: trace the first sec_reqs
+	// so we can see whether `counter` resets to 0 per READ DATA arm or keeps
+	// climbing across arms (=> base+counter delivers the wrong sector).
+	{
+		static uint32_t dbg_n = 0;
+		if (dbg_n < 60) {
+			akiko_diag("[akiko] DBG sec_req#%u base=%d counter=%u -> lba=%d",
+			           dbg_n, cd_data_lba_base, counter, signed_lba);
+			dbg_n++;
+		}
+	}
 	if (signed_lba < 0) {
 		memset(buf, 0, sizeof(buf));
 		akiko_push_sector(buf);
@@ -2076,6 +2175,10 @@ static void akiko_handle_sec_req(void)
 		return;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &ts2);
+
+	// DEBUG (Deep Core, 2026-06-05): verify the PREVIOUS sector's chip-RAM
+	// commit before pushing this one, and stash this sector's expectation.
+	akiko_dbg_check_and_stash(buf, counter, lba);
 
 	akiko_push_sector(buf);
 	clock_gettime(CLOCK_MONOTONIC, &ts3);
