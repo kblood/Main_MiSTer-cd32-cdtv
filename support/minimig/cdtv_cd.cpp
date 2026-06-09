@@ -164,6 +164,20 @@ static unsigned long  stch_next_ms  = 0;
 #define STCH_RETRY_BUDGET    40       // 40 × 250 ms = 10 s of cover
 #define STCH_RETRY_PERIOD_MS 250
 
+// Play-end STCH ack tracking — WinUAE do_stch parity (cdtv.cpp:1292). The
+// status-change interrupt fired at CDDA end-of-play must be retried until the
+// BIOS INT2 handler actually TAKES it (reads the TPI AIR register and sees the
+// STCH source code 0x04), then stopped. A single pulse races with the constant
+// scor/sten interrupt churn and is often lost (HW trace: the seg-1 play-end
+// STCH was taken, the seg-2/map STCH was dropped → DotC map stall); a blind
+// heartbeat (the c59266d "two-segment" attempt) over-injects and re-fires INT2
+// into the next screen → the credits stall. Retry-until-acked fixes both.
+static bool           stch_wait_ack = false;   // armed at CDDA play-end
+#define STCH_PLAYEND_BUDGET    400             // backstop cap (× period) if never acked
+#define STCH_PLAYEND_PERIOD_MS 60              // fast cadence to win the int-churn race
+#define CDTV_AIR_BYTE_OFF      0x00be          // TPI AIR register (reg 7) trace byte offset
+#define CDTV_AIR_CODE_STCH     0x04            // AIR source code = STCH taken/acked
+
 // -----------------------------------------------------------------------------
 // Helpers — gate on CDTV mode
 // -----------------------------------------------------------------------------
@@ -253,10 +267,11 @@ static int   cdtv_trace_count = 0;
 
 static void cdtv_drain_trace(void)
 {
-	// Stop logging once we've collected enough data — keeps /tmp from
-	// filling and the SPI bandwidth used by the drain bounded.
-	if (cdtv_trace_count >= CDTV_TRACE_MAX_ENTRIES) return;
-
+	// ALWAYS drain the ring (so it can't overflow) and scan for the STCH ack
+	// even after file logging is capped — the play-end retry termination
+	// depends on seeing the AIR read. Only the /tmp file WRITE is bounded by
+	// CDTV_TRACE_MAX_ENTRIES; the SPI drain + ack scan run unconditionally.
+	//
 	// Pull entries in a loop until the ring drains. Each entry is 8 payload
 	// bytes + 1 valid marker. Cap iterations per poll so a runaway ring
 	// doesn't lock the loop.
@@ -276,25 +291,38 @@ static void cdtv_drain_trace(void)
 		uint8_t  tag  = buf[3];
 		uint32_t ts   = (uint32_t)(buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24));
 
-		if (!cdtv_trace_fp) {
-			cdtv_trace_fp = fopen("/tmp/cdtv_trace.log", "a");
+		// WinUAE do_stch parity: terminate the play-end STCH retry the moment
+		// the BIOS INT2 handler reads the TPI AIR register and the active
+		// source is STCH (0x04) — i.e. the status-change was delivered AND
+		// taken. Stopping here (vs the old blind heartbeat) avoids re-firing
+		// INT2 into the next screen.
+		if (stch_wait_ack && !(tag & 0x80) /*RD*/ &&
+		    (tag & 0x7F) == 0x0A /*TPI*/ &&
+		    off == CDTV_AIR_BYTE_OFF && din == CDTV_AIR_CODE_STCH) {
+			stch_wait_ack = false;
+			stch_retries  = 0;
+			cdtv_dbg("STCH play-end ACKed (AIR=0x%02x) — retry stopped", din);
 		}
-		if (cdtv_trace_fp) {
-			fprintf(cdtv_trace_fp,
-				"t=%u %s %s off=%04x data=%02x\n",
-				ts,
-				(tag & 0x80) ? "WR" : "RD",
-				cdtv_trace_tag_name(tag),
-				off, din);
-			fflush(cdtv_trace_fp);
-		}
-		cdtv_trace_count++;
-		if (cdtv_trace_count >= CDTV_TRACE_MAX_ENTRIES) {
+
+		if (cdtv_trace_count < CDTV_TRACE_MAX_ENTRIES) {
+			if (!cdtv_trace_fp) {
+				cdtv_trace_fp = fopen("/tmp/cdtv_trace.log", "a");
+			}
 			if (cdtv_trace_fp) {
-				fprintf(cdtv_trace_fp, "[trace capped at %d entries]\n", CDTV_TRACE_MAX_ENTRIES);
+				fprintf(cdtv_trace_fp,
+					"t=%u %s %s off=%04x data=%02x\n",
+					ts,
+					(tag & 0x80) ? "WR" : "RD",
+					cdtv_trace_tag_name(tag),
+					off, din);
 				fflush(cdtv_trace_fp);
 			}
-			break;
+			cdtv_trace_count++;
+			if (cdtv_trace_count >= CDTV_TRACE_MAX_ENTRIES && cdtv_trace_fp) {
+				fprintf(cdtv_trace_fp, "[trace file capped at %d entries; ring drain continues]\n",
+					CDTV_TRACE_MAX_ENTRIES);
+				fflush(cdtv_trace_fp);
+			}
 		}
 	}
 }
@@ -463,14 +491,15 @@ static bool cdtv_cdda_pump(void)
 		// what wakes the BIOS to notice play-end. SUBQ also flips to
 		// PLAY_COMPLETE so any future loop-detection logic can re-arm.
 		cdtv_inject_stch();
-		// Phase-1h EXPERIMENT: WinUAE shows DotC issues a SECOND CDDA PLAY
-		// (lba 9825-12075) ~17 s AFTER this first audio ends. A single
-		// end-of-play STCH wasn't enough; re-arm a SUSTAINED STCH heartbeat
-		// that outlasts that 17 s gap so the cd.device worker keeps getting
-		// status-change pokes until the game advances. Self-terminates in
-		// cdtv_dispatch() the moment the game issues any non-STATUS command.
-		stch_retries = 240;                       // ~60 s @ 250 ms
-		stch_next_ms = GetTimer(STCH_RETRY_PERIOD_MS);
+		// WinUAE do_stch parity (cdtv.cpp:1292): retry the play-end STCH until
+		// the BIOS INT2 handler TAKES it (cdtv_drain_trace sees AIR==0x04),
+		// then stop. A single pulse is lost to the scor/sten interrupt churn
+		// (HW trace: seg-2/map STCH dropped → map stall); the old blind 60 s
+		// heartbeat over-injected → credits stall. Ack-terminated retry fixes
+		// both: it lands the pulse, and stops the instant it is consumed.
+		stch_wait_ack = true;
+		stch_retries  = STCH_PLAYEND_BUDGET;
+		stch_next_ms  = GetTimer(STCH_PLAYEND_PERIOD_MS);
 	}
 	return true;
 }
@@ -807,6 +836,7 @@ static void cdtv_dispatch(void)
 	if (op != 0x81 && stch_retries > 0) {
 		cdtv_dbg("STCH retry budget cleared (op=%02x)", op);
 		stch_retries = 0;
+		stch_wait_ack = false;
 	}
 
 #if CDTV_DEBUG
@@ -1144,7 +1174,10 @@ void cdtv_cd_poll(void)
 	if (stch_retries > 0 && CheckTimer(stch_next_ms)) {
 		cdtv_inject_stch();
 		stch_retries--;
-		stch_next_ms = GetTimer(STCH_RETRY_PERIOD_MS);
+		// Fast cadence while waiting for a play-end ack (win the int-churn
+		// race quickly); slow cadence for the post-mount boot retry.
+		stch_next_ms = GetTimer(stch_wait_ack ? STCH_PLAYEND_PERIOD_MS
+		                                      : STCH_RETRY_PERIOD_MS);
 	}
 
 	// CDDA streaming pump — one sector per FIFO-ready tick. The pump
