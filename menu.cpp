@@ -6484,8 +6484,8 @@ void HandleUI(void)
 
 	// ===================== MinimigCD console variant (simplified menu) =========
 	// Top level: CD / Floppy(df0) / System(CD32|CDTV) / Settings / Reset / Exit.
-	// All RAM/D-Cache/CPU/chipset/HDD/video/config complexity is hidden; only a
-	// single FastRAM control + Main/Ext ROM browse live under Settings. See
+	// ChipRAM/CPU/chipset/HDD/video/config complexity is hidden; Settings exposes
+	// only FastRAM, D-Cache (020 only) and Main/Ext ROM browse. See
 	// research/docs/amiga-console-design-2026-06-13.md.
 	case MENU_MINIMIGCD_MAIN1:
 	{
@@ -6636,7 +6636,7 @@ void HandleUI(void)
 	{
 		OsdSetTitle("Settings", 0);
 		helptext_idx = 0;
-		menumask = 0x0F;           // FastRAM, Main ROM, Ext ROM, Back
+		menumask = 0x1F;           // FastRAM, D-Cache, Main ROM, Ext ROM, Back
 		parentstate = menustate;
 
 		m = 0;
@@ -6645,6 +6645,11 @@ void HandleUI(void)
 		strcpy(s, " FastRAM  : ");
 		strcat(s, config_memory_fast_msg[(minimig_config.cpu >> 1) & 1][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
 		OsdWrite(m++, s, menusub == 0, 0);
+
+		// D-Cache = CPU byte bit4; only meaningful on 020 (grey out otherwise).
+		strcpy(s, " D-Cache  : ");
+		strcat(s, (minimig_config.cpu & 16) ? "ON" : "OFF");
+		OsdWrite(m++, s, menusub == 1, !(minimig_config.cpu & 0x2));
 
 		OsdWrite(m++, "", 0, 0);
 
@@ -6657,7 +6662,7 @@ void HandleUI(void)
 			if (!name[0]) strcat(s, "<none>");
 			else strncat(s, name, 22);
 		}
-		OsdWrite(m++, s, menusub == 1, 0);
+		OsdWrite(m++, s, menusub == 2, 0);
 
 		strcpy(s, " Ext ROM  : ");
 		{
@@ -6672,10 +6677,10 @@ void HandleUI(void)
 				strncat(s, disp, 22);
 			}
 		}
-		OsdWrite(m++, s, menusub == 2, 0);
+		OsdWrite(m++, s, menusub == 3, 0);
 
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 3, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 4, 0);
 
 		menustate = MENU_MINIMIGCD_SETTINGS2;
 		break;
@@ -6711,12 +6716,21 @@ void HandleUI(void)
 				minimig_config.memory = ((fc << 4) & 0x30) | ((fc << 5) & 0x80) | (minimig_config.memory & ~0xB0);
 				menustate = MENU_MINIMIGCD_SETTINGS1;
 			}
-			else if (menusub == 1 && select) // Main ROM
+			else if (menusub == 1) // D-Cache toggle (CPU bit4; 020 only)
+			{
+				if (minimig_config.cpu & 0x2)
+				{
+					minimig_config.cpu ^= 16;
+					minimig_ConfigCPU(minimig_config.cpu);
+				}
+				menustate = MENU_MINIMIGCD_SETTINGS1;
+			}
+			else if (menusub == 2 && select) // Main ROM
 			{
 				ioctl_index = 1;
 				SelectFile(Selected_F[4], "ROM", SCANO_DIR, MENU_MINIMIGCD_ROMFILE_SELECTED, MENU_MINIMIGCD_SETTINGS1);
 			}
-			else if (menusub == 2) // Ext ROM ('-' clears the pairing)
+			else if (menusub == 3) // Ext ROM ('-' clears the pairing)
 			{
 				if (minus)
 				{
@@ -6729,7 +6743,7 @@ void HandleUI(void)
 					SelectFile(Selected_F[5], "ROM", SCANO_DIR | SCANO_UMOUNT, MENU_MINIMIGCD_EXTROMFILE_SELECTED, MENU_MINIMIGCD_SETTINGS1);
 				}
 			}
-			else if (menusub == 3 && select) // Back
+			else if (menusub == 4 && select) // Back
 			{
 				menustate = MENU_MINIMIGCD_MAIN1;
 				menusub = 3;
