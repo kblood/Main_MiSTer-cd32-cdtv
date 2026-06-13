@@ -187,7 +187,7 @@ char *user_io_get_core_path(const char *suffix, int recheck)
 	static char tmp[1024] = {};
 	char *name = (ovr_name[0] && ovr_samedir) ? orig_name : core_name;
 
-	if (!suffix) suffix = (!strncasecmp(name, "minimig", 7)) ? "Amiga" : name;
+	if (!suffix) suffix = (!strncasecmp(name, "minimig", 7) || !strncasecmp(name, "amigacd", 7)) ? "Amiga" : name;
 	if (recheck || strcmp(old_name, suffix) || !tmp[0])
 	{
 		strcpy(old_name, suffix);
