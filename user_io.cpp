@@ -4091,6 +4091,25 @@ void user_io_mouse(unsigned char b, int16_t x, int16_t y, int16_t w)
 	}
 }
 
+// Second mouse for Minimig controller port 2 (dual-mouse support).
+// Only minimig decodes UIO_MOUSE2; all other cores ignore this command, so the
+// P2 stream is harmless when sent and is only emitted when a mouse is actually
+// assigned to player 2 (see input.cpp).
+void user_io_mouse2(unsigned char b, int16_t x, int16_t y, int16_t w)
+{
+	if (osd_is_visible && !is_menu()) return;
+	if (!is_minimig()) return;
+
+	register_activity();
+
+	spi_uio_cmd_cont(UIO_MOUSE2);
+	spi8((x < -127) ? -127 : (x > 127) ? 127 : x);
+	spi8((y < -127) ? -127 : (y > 127) ? 127 : y);
+	spi8(b & 0x07);
+	spi8((w < -127) ? -127 : (w > 127) ? 127 : w);
+	DisableIO();
+}
+
 /* usb modifer bits:
 0     1     2    3    4     5     6    7
 LCTRL LSHIFT LALT LGUI RCTRL RSHIFT RALT RGUI
