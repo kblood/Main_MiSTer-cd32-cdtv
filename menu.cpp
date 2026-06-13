@@ -186,6 +186,16 @@ enum MENU
 	MENU_MINIMIG_SAVECONFIG1,
 	MENU_MINIMIG_SAVECONFIG2,
 
+	// MinimigCD — simplified "console" Minimig variant
+	MENU_MINIMIGCD_MAIN1,
+	MENU_MINIMIGCD_MAIN2,
+	MENU_MINIMIGCD_SETTINGS1,
+	MENU_MINIMIGCD_SETTINGS2,
+	MENU_MINIMIGCD_CDFILE_SELECTED,
+	MENU_MINIMIGCD_ADFFILE_SELECTED,
+	MENU_MINIMIGCD_ROMFILE_SELECTED,
+	MENU_MINIMIGCD_EXTROMFILE_SELECTED,
+
 	// Atari ST
 	MENU_ST_MAIN1,
 	MENU_ST_MAIN2,
@@ -5809,6 +5819,12 @@ void HandleUI(void)
 		/* minimig main menu                                              */
 		/******************************************************************/
 	case MENU_MINIMIG_MAIN1:
+		// MinimigCD console variant: render the simplified menu instead of the
+		// full Minimig top level. This is the single external entry point for
+		// the Minimig top level (OSD open / MGL load); MinimigCD states never set
+		// MENU_MINIMIG_MAIN1, so the redirect only fires on a fresh entry.
+		if (is_minimigcd()) { menustate = MENU_MINIMIGCD_MAIN1; break; }
+
 		menumask = 0x1EF0;
 		OsdSetTitle("Minimig", OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
 		helptext_idx = HELPTEXT_MAIN;
@@ -6465,6 +6481,284 @@ void HandleUI(void)
 		minimig_set_extrom(selPath);
 		menustate = MENU_MINIMIG_CHIPSET1;
 		break;
+
+	// ===================== MinimigCD console variant (simplified menu) =========
+	// Top level: CD / Floppy(df0) / System(CD32|CDTV) / Settings / Reset / Exit.
+	// All RAM/D-Cache/CPU/chipset/HDD/video/config complexity is hidden; only a
+	// single FastRAM control + Main/Ext ROM browse live under Settings. See
+	// research/docs/amiga-console-design-2026-06-13.md.
+	case MENU_MINIMIGCD_MAIN1:
+	{
+		OsdSetTitle("MinimigCD", 0);
+		helptext_idx = 0;
+		menumask = 0x3F;            // CD, Floppy, System, Settings, Reset, Exit
+		parentstate = menustate;
+
+		int cdtv = minimigcd_is_cdtv();
+		m = 0;
+		OsdWrite(m++, "", 0, 0);
+
+		// CD slot = hardfile[0]
+		strcpy(s, " CD       : ");
+		if (minimig_config.hardfile[0].filename[0])
+		{
+			char *name = minimig_config.hardfile[0].filename;
+			char *p = strrchr(name, '/');
+			strncat(s, p ? p + 1 : name, 24);
+		}
+		else strcat(s, "* no disc *");
+		OsdWrite(m++, s, menusub == 0, 0);
+
+		// Floppy df0
+		strcpy(s, " Floppy   : ");
+		if (df[0].status & DSK_INSERTED)
+		{
+			char *p = strrchr(df[0].name, '/');
+			strncat(s, p ? p + 1 : df[0].name, 24);
+		}
+		else strcat(s, "* no disk *");
+		OsdWrite(m++, s, menusub == 1, 0);
+
+		OsdWrite(m++, "", 0, 0);
+
+		strcpy(s, " System   : ");
+		strcat(s, cdtv ? "CDTV" : "CD32");
+		OsdWrite(m++, s, menusub == 2, 0);
+
+		OsdWrite(m++, "", 0, 0);
+		OsdWrite(m++, " Settings                 \x16", menusub == 3, 0);
+
+		for (int i = m; i < OsdGetSize() - 2; i++) OsdWrite(i, "", 0, 0);
+		OsdWrite(OsdGetSize() - 2, " Reset", menusub == 4, 0);
+		OsdWrite(OsdGetSize() - 1, STD_EXIT, menusub == 5, 0);
+
+		menustate = MENU_MINIMIGCD_MAIN2;
+		break;
+	}
+
+	case MENU_MINIMIGCD_MAIN2:
+		if (menu)
+		{
+			menustate = MENU_NONE1;
+		}
+		else if (c == KEY_BACKSPACE && menusub == 0) // eject CD
+		{
+			minimig_config.hardfile[0].filename[0] = 0;
+			ide_open(0, "");
+			menustate = MENU_MINIMIGCD_MAIN1;
+		}
+		else if (select || recent || minus || plus)
+		{
+			if (menusub == 0) // CD: always (re)select a disc image
+			{
+				if (select || recent)
+				{
+					fs_Options = SCANO_DIR | SCANO_UMOUNT;
+					fs_MenuSelect = MENU_MINIMIGCD_CDFILE_SELECTED;
+					fs_MenuCancel = MENU_MINIMIGCD_MAIN1;
+					strcpy(fs_pFileExt, "ISOCUECHDIMG");
+					if (select)
+					{
+						if (!Selected_S[0][0]) memcpy(Selected_S[0], minimig_config.hardfile[0].filename, sizeof(Selected_S[0]));
+						SelectFile(Selected_S[0], fs_pFileExt, fs_Options, fs_MenuSelect, fs_MenuCancel);
+					}
+					else if (recent_init(500)) menustate = MENU_RECENT1;
+				}
+			}
+			else if (menusub == 1) // Floppy df0
+			{
+				if (df[0].status & DSK_INSERTED) // eject
+				{
+					df[0].status = 0;
+					FileClose(&df[0].file);
+					menustate = MENU_MINIMIGCD_MAIN1;
+				}
+				else if (select || recent)
+				{
+					ioctl_index = 0;
+					df[0].status = 0;
+					fs_Options = SCANO_DIR;
+					fs_MenuSelect = MENU_MINIMIGCD_ADFFILE_SELECTED;
+					fs_MenuCancel = MENU_MINIMIGCD_MAIN1;
+					strcpy(fs_pFileExt, "ADF");
+					if (select) SelectFile(Selected_F[0], "ADF", fs_Options, fs_MenuSelect, fs_MenuCancel);
+					else if (recent_init(0)) menustate = MENU_RECENT1;
+				}
+			}
+			else if (menusub == 2) // System: toggle CD32 <-> CDTV
+			{
+				if (select || minus || plus)
+				{
+					minimigcd_apply_system(minimigcd_is_cdtv() ? 0 : 1);
+					// Refresh the active bridge with the mounted CD, if any.
+					if (minimig_config.hardfile[0].filename[0])
+						ide_open(0, minimig_config.hardfile[0].filename);
+					menustate = MENU_MINIMIGCD_MAIN1;
+				}
+			}
+			else if (menusub == 3 && select) // Settings submenu
+			{
+				menusub = 0;
+				menustate = MENU_MINIMIGCD_SETTINGS1;
+			}
+			else if (menusub == 4 && select) // Reset
+			{
+				menustate = MENU_NONE1;
+				minimig_reset();
+			}
+			else if (menusub == 5 && select) // Exit
+			{
+				menustate = MENU_NONE1;
+			}
+		}
+		else if (c == KEY_BACKSPACE && menusub == 1) // eject floppy
+		{
+			df[0].status = 0;
+			FileClose(&df[0].file);
+			menustate = MENU_MINIMIGCD_MAIN1;
+		}
+		break;
+
+	case MENU_MINIMIGCD_SETTINGS1:
+	{
+		OsdSetTitle("Settings", 0);
+		helptext_idx = 0;
+		menumask = 0x0F;           // FastRAM, Main ROM, Ext ROM, Back
+		parentstate = menustate;
+
+		m = 0;
+		OsdWrite(m++, "", 0, 0);
+
+		strcpy(s, " FastRAM  : ");
+		strcat(s, config_memory_fast_msg[(minimig_config.cpu >> 1) & 1][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
+		OsdWrite(m++, s, menusub == 0, 0);
+
+		OsdWrite(m++, "", 0, 0);
+
+		strcpy(s, " Main ROM : ");
+		{
+			const char *root = getRootDir();
+			int rlen = strlen(root);
+			char *name = minimig_config.kickstart;
+			if (!strncasecmp(name, root, rlen) && name[rlen] == '/') name += rlen + 1;
+			if (!name[0]) strcat(s, "<none>");
+			else strncat(s, name, 22);
+		}
+		OsdWrite(m++, s, menusub == 1, 0);
+
+		strcpy(s, " Ext ROM  : ");
+		{
+			const char *name = minimig_get_extrom();
+			if (!name[0]) strcat(s, "<none>");
+			else
+			{
+				const char *root = getRootDir();
+				int rlen = strlen(root);
+				const char *disp = name;
+				if (!strncasecmp(name, root, rlen) && name[rlen] == '/') disp += rlen + 1;
+				strncat(s, disp, 22);
+			}
+		}
+		OsdWrite(m++, s, menusub == 2, 0);
+
+		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 3, 0);
+
+		menustate = MENU_MINIMIGCD_SETTINGS2;
+		break;
+	}
+
+	case MENU_MINIMIGCD_SETTINGS2:
+		if (menu)
+		{
+			menustate = MENU_NONE1;
+		}
+		else if (back || left)
+		{
+			menustate = MENU_MINIMIGCD_MAIN1;
+			menusub = 3;
+		}
+		else if (select || minus || plus)
+		{
+			if (menusub == 0) // FastRAM cycle (mirrors CHIPSET2 menusub 5)
+			{
+				int fc = (((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5));
+				if (minus)
+				{
+					fc--;
+					if (fc < 0) fc = 5;
+					if (!(minimig_config.cpu & 2) && fc > 3) fc = 3;
+				}
+				else
+				{
+					fc++;
+					if (fc > 5) fc = 0;
+					if (!(minimig_config.cpu & 2) && fc > 3) fc = 0;
+				}
+				minimig_config.memory = ((fc << 4) & 0x30) | ((fc << 5) & 0x80) | (minimig_config.memory & ~0xB0);
+				menustate = MENU_MINIMIGCD_SETTINGS1;
+			}
+			else if (menusub == 1 && select) // Main ROM
+			{
+				ioctl_index = 1;
+				SelectFile(Selected_F[4], "ROM", SCANO_DIR, MENU_MINIMIGCD_ROMFILE_SELECTED, MENU_MINIMIGCD_SETTINGS1);
+			}
+			else if (menusub == 2) // Ext ROM ('-' clears the pairing)
+			{
+				if (minus)
+				{
+					minimig_set_extrom((char *)"");
+					menustate = MENU_MINIMIGCD_SETTINGS1;
+				}
+				else if (select)
+				{
+					ioctl_index = 1;
+					SelectFile(Selected_F[5], "ROM", SCANO_DIR | SCANO_UMOUNT, MENU_MINIMIGCD_EXTROMFILE_SELECTED, MENU_MINIMIGCD_SETTINGS1);
+				}
+			}
+			else if (menusub == 3 && select) // Back
+			{
+				menustate = MENU_MINIMIGCD_MAIN1;
+				menusub = 3;
+			}
+		}
+		break;
+
+	case MENU_MINIMIGCD_CDFILE_SELECTED:
+		memcpy(Selected_S[0], selPath, sizeof(Selected_S[0]));
+		recent_update(SelectedDir, selPath, SelectedLabel, 500);
+		{
+			uint len = strlen(selPath);
+			if (len > sizeof(minimig_config.hardfile[0].filename) - 1) len = sizeof(minimig_config.hardfile[0].filename) - 1;
+			memcpy(minimig_config.hardfile[0].filename, selPath, len);
+			minimig_config.hardfile[0].filename[len] = 0;
+		}
+		minimig_config.hardfile[0].cfg = 2;
+		ide_open(0, minimig_config.hardfile[0].filename);
+		menusub = 0;
+		menustate = MENU_MINIMIGCD_MAIN1;
+		break;
+
+	case MENU_MINIMIGCD_ADFFILE_SELECTED:
+		memcpy(Selected_F[0], selPath, sizeof(Selected_F[0]));
+		recent_update(SelectedDir, selPath, SelectedLabel, 0);
+		InsertFloppy(&df[0], selPath);
+		menusub = 1;
+		menustate = MENU_MINIMIGCD_MAIN1;
+		break;
+
+	case MENU_MINIMIGCD_ROMFILE_SELECTED:
+		memcpy(Selected_F[4], selPath, sizeof(Selected_F[4]));
+		minimig_set_kickstart(selPath);
+		menustate = MENU_MINIMIGCD_SETTINGS1;
+		break;
+
+	case MENU_MINIMIGCD_EXTROMFILE_SELECTED:
+		memcpy(Selected_F[5], selPath, sizeof(Selected_F[5]));
+		minimig_set_extrom(selPath);
+		menustate = MENU_MINIMIGCD_SETTINGS1;
+		break;
+	// =================== end MinimigCD console variant =========================
 
 	case MENU_MINIMIG_DISK1:
 		helptext_idx = HELPTEXT_HARDFILE;

@@ -745,6 +745,14 @@ int minimig_cfg_load(int num)
 		minimig_config.hardfile[3].cfg = 0;
 		minimig_config.hardfile[3].filename[0] = 0;
 		BootPrintEx(">>> No config found. Using defaults. <<<");
+
+		// MinimigCD console variant: no saved CFG -> start as a CD32 with its
+		// authentic profile + PSX-style default ROMs auto-found in /media/fat/.
+		if (is_minimigcd())
+		{
+			minimigcd_apply_system(0); // 0 = CD32
+			BootPrintEx(">>> MinimigCD: defaulting to CD32. <<<");
+		}
 	}
 
 	// Restore the A2065 interface selection for this slot (kept in core status
@@ -817,6 +825,82 @@ void minimig_set_extrom(char *name)
 	memcpy(minimig_config.kickstart + off, name, nlen);
 	memset(minimig_config.kickstart + off + nlen, 0, cap - off - nlen);
 	force_reload_kickstart = 1;
+}
+
+// ---- MinimigCD console variant: per-system profiles + default ROM auto-load ----
+// PSX-BIOS style: a small set of default Kickstart filenames live in the core
+// boot folder (/media/fat/ = getRootDir()); the System toggle picks which pair
+// to auto-load. Names follow the FS-UAE / Amiga Forever convention. See
+// research/docs/amiga-console-design-2026-06-13.md and the shipped MinimigCD-ROMs
+// guide.
+
+void minimigcd_default_rom_names(int cdtv, const char **main_name, const char **ext_name)
+{
+	if (cdtv)
+	{
+		if (main_name) *main_name = "kick34005.CDTV";       // Kickstart 1.3 rev 34.5 (256K)
+		if (ext_name)  *ext_name  = "kick34005.CDTV.ext";   // CDTV extended ROM
+	}
+	else
+	{
+		if (main_name) *main_name = "kick40060.CD32";       // Kickstart 3.1 rev 40.60 (512K)
+		if (ext_name)  *ext_name  = "kick40060.CD32.ext";   // CD32 extended ROM
+	}
+}
+
+// Point the main + ext ROM at this system's defaults under the boot folder.
+// Only sets the ext pairing if the ext file actually exists, so a missing ext
+// ROM doesn't force the composite path / a load failure.
+void minimigcd_set_default_roms(int cdtv)
+{
+	const char *mname = 0, *ename = 0;
+	minimigcd_default_rom_names(cdtv, &mname, &ename);
+
+	char mpath[1024], epath[1024];
+	snprintf(mpath, sizeof(mpath), "%s/%s", getRootDir(), mname);
+	snprintf(epath, sizeof(epath), "%s/%s", getRootDir(), ename);
+
+	minimig_set_kickstart(mpath);              // also clears any stale ext pairing
+	if (FileExists(epath, 0)) minimig_set_extrom(epath);
+}
+
+// Apply a complete authentic CD32 or CDTV machine profile (CPU / chipset /
+// memory / IDE) + default ROMs, and push the live config to the FPGA. ChipRAM
+// and the D-Cache state are baked into the profile and intentionally NOT exposed
+// in the MinimigCD menu; only FastRAM is user-adjustable. Byte values match the
+// HW-verified production CD32 (CannonFodder-CD32MVP: cpu 0x13, chipset 0x18,
+// 2M chip + 8M fast) and CDTV (DotC/Dune: cpu 0x00, chipset 0x20, 1M chip)
+// launch CFGs.
+void minimigcd_apply_system(int cdtv)
+{
+	if (cdtv)
+	{
+		minimig_config.cpu     = 0x00; // 68000
+		minimig_config.chipset = 0x20; // OCS + CONFIG_CDTV
+		minimig_config.memory  = 0x01; // 1M chip, no fast
+		minimig_config.ide_cfg = 0x00; // CDTV bridge (no IDE)
+	}
+	else
+	{
+		minimig_config.cpu     = 0x13; // 68EC020 + turbo + D-Cache
+		minimig_config.chipset = 0x18; // AGA + ECS (PAL)
+		minimig_config.memory  = 0x33; // 2M chip + 8M fast
+		minimig_config.ide_cfg = 0x01; // akiko / IDE
+	}
+	minimig_config.hardfile[0].cfg = 2; // single removable CD slot
+	if (minimig_config.floppy.drives < 1) minimig_config.floppy.drives = 1; // single df0
+
+	minimigcd_set_default_roms(cdtv);
+
+	minimig_ConfigCPU(minimig_config.cpu);
+	minimig_ConfigChipset(minimig_config.chipset);
+	minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
+	// memory is applied on reset via the UploadKickstart / ApplyConfiguration path
+}
+
+int minimigcd_is_cdtv(void)
+{
+	return (minimig_config.chipset & CONFIG_CDTV) ? 1 : 0;
 }
 
 static char minimig_adjust = 0;

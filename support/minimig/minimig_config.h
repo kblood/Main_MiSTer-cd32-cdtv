@@ -87,4 +87,10 @@ void minimig_ConfigAutofire(unsigned char autofire, unsigned char mask);
 void minimig_set_extcfg(unsigned int ext_cfg);
 unsigned int minimig_get_extcfg();
 
+// MinimigCD console variant helpers (see minimig_config.cpp).
+void minimigcd_default_rom_names(int cdtv, const char **main_name, const char **ext_name);
+void minimigcd_set_default_roms(int cdtv);
+void minimigcd_apply_system(int cdtv);
+int  minimigcd_is_cdtv(void);
+
 #endif
