@@ -6418,7 +6418,10 @@ void HandleUI(void)
 	// research/docs/amiga-console-design-2026-06-13.md.
 	case MENU_AMIGACD_MAIN1:
 	{
-		OsdSetTitle("AmigaCD", 0);
+		// LEFT/RIGHT arrows page out to the stock MiSTer common menus (System:
+		// load other cores + Reboot-to-menu; Misc: volume/config/info) -- only
+		// the core menu itself is reskinned, the MiSTer menu stays reachable.
+		OsdSetTitle("AmigaCD", OSD_ARROW_LEFT | OSD_ARROW_RIGHT);
 		helptext_idx = 0;
 		menumask = 0x3F;            // CD, Floppy, System, Settings, Reset, Exit
 		parentstate = menustate;
@@ -6545,6 +6548,16 @@ void HandleUI(void)
 			df[0].status = 0;
 			FileClose(&df[0].file);
 			menustate = MENU_AMIGACD_MAIN1;
+		}
+		else if (right) // -> stock MiSTer "System" menu (load cores / reboot)
+		{
+			menustate = MENU_COMMON1;
+			menusub = 0;
+		}
+		else if (left) // -> stock MiSTer "Misc. Options" menu (volume / info)
+		{
+			menustate = MENU_MISC1;
+			menusub = 3;
 		}
 		break;
 
