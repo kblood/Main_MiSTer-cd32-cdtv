@@ -261,9 +261,21 @@ static int is_minimig_type = 0;
 char is_minimig()
 {
 	// Prefix-match so renamed CONF_STR variants ("MinimigCD" for our CD32+CDTV
-	// fork, etc.) still satisfy the Minimig-specific code paths gated below.
-	if (!is_minimig_type) is_minimig_type = strncasecmp(orig_name, "minimig", 7) ? 2 : 1;
+	// fork, "AmigaCD" for the simplified console variant, etc.) still satisfy
+	// the Minimig-specific code paths gated below.
+	if (!is_minimig_type) is_minimig_type =
+		(!strncasecmp(orig_name, "minimig", 7) || !strncasecmp(orig_name, "amigacd", 7)) ? 1 : 2;
 	return (is_minimig_type == 1);
+}
+
+static int is_amigacd_type = 0;
+char is_amigacd()
+{
+	// The simplified "console" Minimig variant (CONF_STR "AmigaCD"). Renders a
+	// stripped-down OSD (CD / Floppy / System / Settings) instead of the full
+	// MinimigCD menu. Still a Minimig core (is_minimig() also matches it).
+	if (!is_amigacd_type) is_amigacd_type = strncasecmp(orig_name, "amigacd", 7) ? 2 : 1;
+	return (is_amigacd_type == 1);
 }
 
 static int is_megacd_type = 0;
@@ -420,6 +432,7 @@ void user_io_read_core_name()
 	is_zx81_type = 0;
 	is_neogeo_type = 0;
 	is_minimig_type = 0;
+	is_amigacd_type = 0;
 	is_megacd_type = 0;
 	is_pce_type = 0;
 	is_archie_type = 0;
