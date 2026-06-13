@@ -87,4 +87,10 @@ void minimig_ConfigAutofire(unsigned char autofire, unsigned char mask);
 void minimig_set_extcfg(unsigned int ext_cfg);
 unsigned int minimig_get_extcfg();
 
+// AmigaCD console variant helpers (see minimig_config.cpp).
+void amigacd_default_rom_names(int cdtv, const char **main_name, const char **ext_name);
+void amigacd_set_default_roms(int cdtv);
+void amigacd_apply_system(int cdtv);
+int  amigacd_is_cdtv(void);
+
 #endif
