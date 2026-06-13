@@ -884,7 +884,7 @@ void amigacd_apply_system(int cdtv)
 	{
 		minimig_config.cpu     = 0x13; // 68EC020 + turbo + D-Cache
 		minimig_config.chipset = 0x18; // AGA + ECS (PAL)
-		minimig_config.memory  = 0x33; // 2M chip + 8M fast
+		minimig_config.memory  = 0x03; // 2M chip, no fast (authentic CD32 default)
 		minimig_config.ide_cfg = 0x01; // akiko / IDE
 	}
 	minimig_config.hardfile[0].cfg = 2; // single removable CD slot
