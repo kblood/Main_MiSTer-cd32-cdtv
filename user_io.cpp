@@ -199,7 +199,7 @@ char *user_io_get_core_path(const char *suffix, int recheck)
 	static char tmp[1024] = {};
 	char *name = (ovr_name[0] && ovr_samedir) ? orig_name : core_name;
 
-	if (!suffix) suffix = (!strcasecmp(name, "minimig")) ? "Amiga" : name;
+	if (!suffix) suffix = (!strcasecmp(name, "minimig") || !strcasecmp(name, "amigacd")) ? "Amiga" : name;
 	if (recheck || strcmp(old_name, suffix) || !tmp[0])
 	{
 		strcpy(old_name, suffix);
