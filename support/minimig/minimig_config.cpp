@@ -866,11 +866,10 @@ void amigacd_set_default_roms(int cdtv)
 
 // Apply a complete authentic CD32 or CDTV machine profile (CPU / chipset /
 // memory / IDE) + default ROMs, and push the live config to the FPGA. ChipRAM
-// and the D-Cache state are baked into the profile and intentionally NOT exposed
-// in the AmigaCD menu; only FastRAM is user-adjustable. Byte values match the
-// HW-verified production CD32 (CannonFodder-CD32MVP: cpu 0x13, chipset 0x18,
-// 2M chip + 8M fast) and CDTV (DotC/Dune: cpu 0x00, chipset 0x20, 1M chip)
-// launch CFGs.
+// is baked into the profile; FastRAM and D-Cache are user-adjustable in the
+// AmigaCD Settings menu. Defaults match an authentic CD32: D-Cache OFF (the
+// 68EC020 has no data cache) and no FastRAM. CDTV is a 68000 (cpu 0x00,
+// chipset 0x20, 1M chip).
 void amigacd_apply_system(int cdtv)
 {
 	if (cdtv)
@@ -882,7 +881,7 @@ void amigacd_apply_system(int cdtv)
 	}
 	else
 	{
-		minimig_config.cpu     = 0x13; // 68EC020 + turbo + D-Cache
+		minimig_config.cpu     = 0x03; // 68EC020, D-Cache OFF (authentic CD32 default)
 		minimig_config.chipset = 0x18; // AGA + ECS (PAL)
 		minimig_config.memory  = 0x03; // 2M chip, no fast (authentic CD32 default)
 		minimig_config.ide_cfg = 0x01; // akiko / IDE
