@@ -6423,7 +6423,7 @@ void HandleUI(void)
 		// the core menu itself is reskinned, the MiSTer menu stays reachable.
 		OsdSetTitle("AmigaCD", OSD_ARROW_LEFT | OSD_ARROW_RIGHT);
 		helptext_idx = 0;
-		menumask = 0x3F;            // CD, Floppy, System, Settings, Reset, Exit
+		menumask = 0x7F;            // CD, Floppy, System, Settings, Save, Reset, Exit
 		parentstate = menustate;
 
 		int cdtv = amigacd_is_cdtv();
@@ -6459,10 +6459,11 @@ void HandleUI(void)
 
 		OsdWrite(m++, "", 0, 0);
 		OsdWrite(m++, " Settings                 \x16", menusub == 3, 0);
+		OsdWrite(m++, " Save settings", menusub == 4, 0);
 
 		for (int i = m; i < OsdGetSize() - 2; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 2, " Reset", menusub == 4, 0);
-		OsdWrite(OsdGetSize() - 1, STD_EXIT, menusub == 5, 0);
+		OsdWrite(OsdGetSize() - 2, " Reset", menusub == 5, 0);
+		OsdWrite(OsdGetSize() - 1, STD_EXIT, menusub == 6, 0);
 
 		menustate = MENU_AMIGACD_MAIN2;
 		break;
@@ -6533,12 +6534,23 @@ void HandleUI(void)
 				menusub = 0;
 				menustate = MENU_AMIGACD_SETTINGS1;
 			}
-			else if (menusub == 4 && select) // Reset
+			else if (menusub == 4 && select) // Save settings -> default config slot 0
+			{
+				// Persists the whole minimig_config: mounted CD (hardfile[0]),
+				// RAM (memory), CPU/chipset (System profile), D-Cache and ROMs.
+				// minimig_cfg_load(0) restores it on the next core load, and
+				// ApplyConfiguration()->hdd_open(0) re-mounts the saved CD.
+				minimig_cfg_save(0);
+				minimig_mgl_save();
+				Info("Settings saved", 1500);
+				menustate = MENU_AMIGACD_MAIN1;
+			}
+			else if (menusub == 5 && select) // Reset
 			{
 				menustate = MENU_NONE1;
 				minimig_reset();
 			}
-			else if (menusub == 5 && select) // Exit
+			else if (menusub == 6 && select) // Exit
 			{
 				menustate = MENU_NONE1;
 			}
