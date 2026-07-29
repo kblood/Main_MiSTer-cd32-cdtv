@@ -343,11 +343,14 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	drv->total_sectors = total_sector_size / 512;
 	drv->chd_total_size = total_sector_size;
 
+	// First data track, matching load_cue_file(). Without the break this lands
+	// on the last one, so the two loaders disagree on a multi-data-track disc.
 	for (uint8_t i = 0; i < drv->track_cnt; i++)
 	{
 		if (drv->track[i].attr == 0x40)
 		{
 			drv->data_num = i;
+			break;
 		}
 	}
 
