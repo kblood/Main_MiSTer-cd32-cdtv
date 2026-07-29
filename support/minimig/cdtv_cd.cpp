@@ -1,4 +1,4 @@
-// CDTV native-mode bridge — Main_MiSTer side (M2 phase-1c).
+// CDTV native-mode bridge — Main_MiSTer side.
 //
 // Mirrors WinUAE's CR-511 command_thread (cdtv.cpp:524-695) just far enough to
 // unblock the CDTV Welcome splash and let a title boot. Talks to the FPGA
@@ -64,15 +64,16 @@ static void cdtv_diag(const char *fmt, ...)
 // Bridge constants
 // -----------------------------------------------------------------------------
 #define CDTV_BRIDGE_ADDR   0xF800
-// Phase-1b sector-push sub-channel: io_din[5]=1 inside the CDTV class
+// Sector-push sub-channel: io_din[5]=1 inside the CDTV class
 // (hps_ext.v cdtv_cs_sec). Each spi_w pushes one byte into the bridge's
 // 8 KB sector staging FIFO; the bridge's drain FSM master-writes them to
 // chip RAM at `acr` via chipdma_arb.
 #define CDTV_SEC_ADDR      0xF820
-// Phase-1e STCH-inject sub-channel: io_din[6]=1 inside the CDTV class
+// STCH-inject sub-channel: io_din[6]=1 inside the CDTV class
 // (hps_ext.v cdtv_cs_stch). Any byte written here pulses cdtv_bridge.stch.
+// Reading it returns the sticky stch_ack flag in bit 0 and clears it.
 #define CDTV_STCH_ADDR     0xF840
-// CDDA audio FIFO sub-channel — shared with akiko_cd32.cpp Phase 33.
+// CDDA audio FIFO sub-channel — shared with akiko_cd32.cpp.
 // hps_ext.v:191 selects cdda_cs on io_din[15:9] == 7'b1111001 → 0xF200.
 // Each spi_w pushes a 16-bit sample (high byte first for L/R alternation).
 // FIFO depth backpressure shows in the status word as cdda_req (bit 8).
@@ -122,7 +123,7 @@ static uint16_t cd_sectorsize  = 2048;
 // CD path tracking (from ide_cdrom mount/unmount).
 static char     cd_path_active[1024] = {0};
 
-// CDDA streaming pump state (mirrors akiko_cd32.cpp Phase 33). lba_next
+// CDDA streaming pump state (mirrors akiko_cd32.cpp). lba_next
 // is -1 when idle; otherwise it's the next absolute LBA to read and push
 // to UIO 0xF200. lba_end is the exclusive end. cd_paused freezes the pump
 // without tearing the working set down.
@@ -137,16 +138,16 @@ static uint8_t  cd_paused          = 0;
 //   0x13 PLAY_COMPLETE  — natural end reached, holds last position
 //   0x14 PLAY_ERROR     — read failure / abort
 //   0x15 NO_STATUS      — idle (never played / stopped)
-// DotC's title-music loop polls 0x87 SUBQ to detect PLAY_COMPLETE and
-// re-arm the cue. With the old stub frozen at IN_PROGRESS+00:00:00 the
-// loop never closed and the title screen stalled.
+// Defenders of the Crown's title-music loop polls 0x87 SUBQ to detect
+// PLAY_COMPLETE and re-arm the cue; pinned at IN_PROGRESS with a
+// 00:00:00 position the loop never closes and the title screen stalls.
 static uint8_t  cd_audio_status    = 0x15;
 
 // Last LBA we pumped, preserved across natural-end so SUBQ keeps reporting
 // the right position after the pump tears down.
 static int32_t  cdtv_last_lba      = 0;
 
-// Phase-1e: STCH inject retry budget. The cdtv_bridge ilatch is wiped while
+// STCH inject retry budget. The cdtv_bridge ilatch is wiped while
 // CPU is held in reset (minimig.v:474 `reset = sys_reset | ~_cpu_reset_in`),
 // so a single STCH pulse fired during BootInit gets dropped. Worse, BIOS
 // init may also clear ilatch[2] via TPI register-2 write before unmasking,
@@ -163,15 +164,14 @@ static unsigned long  stch_next_ms  = 0;
 // status-change interrupt fired at CDDA end-of-play must be retried until the
 // BIOS INT2 handler actually TAKES it (reads the TPI AIR register and sees the
 // STCH source code 0x04), then stopped. A single pulse races with the constant
-// scor/sten interrupt churn and is often lost (HW trace: the seg-1 play-end
-// STCH was taken, the seg-2/map STCH was dropped → DotC map stall); a blind
-// heartbeat (the c59266d "two-segment" attempt) over-injects and re-fires INT2
-// into the next screen → the credits stall. Retry-until-acked fixes both.
+// scor/sten interrupt churn and is often lost — a bus trace of Defenders
+// of the Crown shows the first play-end STCH taken and the second
+// dropped, stalling the map screen. A blind heartbeat instead
+// over-injects, re-firing INT2 into the following screen and stalling
+// the credits. Retry-until-acked avoids both.
 static bool           stch_wait_ack = false;   // armed at CDDA play-end
 #define STCH_PLAYEND_BUDGET    400             // backstop cap (× period) if never acked
 #define STCH_PLAYEND_PERIOD_MS 60              // fast cadence to win the int-churn race
-#define CDTV_AIR_BYTE_OFF      0x00be          // TPI AIR register (reg 7) trace byte offset
-#define CDTV_AIR_CODE_STCH     0x04            // AIR source code = STCH taken/acked
 
 // -----------------------------------------------------------------------------
 // Helpers — gate on CDTV mode
@@ -285,7 +285,7 @@ static void cdtv_push_sector(const uint8_t *buf, int len)
 }
 
 // -----------------------------------------------------------------------------
-// CDDA streaming — same UIO 0xF200 channel as akiko_cd32.cpp Phase 33.
+// CDDA streaming — same UIO 0xF200 channel as akiko_cd32.cpp.
 // rtl/cdda.v is instantiated unconditionally in Minimig.sv and mixed into
 // the audio output, so we don't need a CDTV-specific FPGA hook.
 // -----------------------------------------------------------------------------
@@ -413,9 +413,9 @@ static bool cdtv_cdda_pump(void)
 		// WinUAE do_stch parity (cdtv.cpp:1292): retry the play-end STCH until
 		// the BIOS INT2 handler TAKES it (the bridge sets stch_ack),
 		// then stop. A single pulse is lost to the scor/sten interrupt churn
-		// (HW trace: seg-2/map STCH dropped → map stall); the old blind 60 s
-		// heartbeat over-injected → credits stall. Ack-terminated retry fixes
-		// both: it lands the pulse, and stops the instant it is consumed.
+		// and the map screen then stalls; a blind heartbeat instead
+		// over-injects and stalls the credits. Ack-terminated retry lands
+		// the pulse and stops the instant it is consumed.
 		stch_wait_ack = true;
 		stch_retries  = STCH_PLAYEND_BUDGET;
 		stch_next_ms  = GetTimer(STCH_PLAYEND_PERIOD_MS);
@@ -891,8 +891,8 @@ static void cdtv_dispatch(void)
 		}
 
 		case 0x82: {
-			// Last error / sense (6 bytes). For M2 phase-1c we report no
-			// outstanding error (just enough to satisfy any BIOS query).
+			// Last error / sense (6 bytes). We report no outstanding
+			// error — just enough to satisfy a BIOS query.
 			memset(reply, 0, 6);
 			if (cd_error) reply[2] |= 1 << 4;
 			cd_error   = 0;
@@ -1048,9 +1048,9 @@ void cdtv_cd_init(void)
 	// BEFORE minimig_boot.cpp's BootInit() reaches cdtv_cd_init. So this
 	// init must preserve any mount state established by the earlier call
 	// (cd_media + cd_isready); only the transient command/state machine
-	// vars get cleared. Clobbering cd_isready here was the M2 phase-1c bug
-	// that made STATUS reply 0x41 ("media present, drive NOT ready"),
-	// stalling the CDTV BIOS at the Welcome splash with disc inserted.
+	// vars get cleared. Clobbering cd_isready here makes STATUS reply 0x41
+	// ("media present, drive NOT ready"), which stalls the CDTV BIOS at the
+	// Welcome splash with a disc inserted.
 	cmd_idx       = 0;
 	cmd_need      = 0;
 	cd_motor      = 0;

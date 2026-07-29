@@ -1158,16 +1158,16 @@ int cdrom_read_raw_sector(drive_t *drive, uint32_t lba, uint8_t *buf)
 
 	if (drive->chd_f)
 	{
-		// Phase 24 (CD32 native Akiko): use the per-track chd_offset from
-		// the track that owns this LBA, not drive->data_num. mister_chd.cpp:153
-		// computes offset = (sector_cnt + pregap - track.start) per track —
-		// CHD pads each track to a multiple of 4 sectors, so the BIOS-LBA →
-		// CHD-LBA delta differs per track. The original code worked for
-		// typical single-data-track CDs (where data_num always lands on
-		// track 0) but fails on multi-data-track CHDs like Cannon Fodder
-		// CD32: the data_num picker at line 360 has no break and ends up
-		// on the LAST data track, whose chd_offset (~ -223 unsigned wrap)
-		// then breaks every read for the FIRST data track.
+		// Use the per-track chd_offset from the track that owns this LBA,
+		// not drive->data_num. mister_chd.cpp:153 computes offset =
+		// (sector_cnt + pregap - track.start) per track — CHD pads each track
+		// to a multiple of 4 sectors, so the BIOS-LBA → CHD-LBA delta differs
+		// per track. Keying off data_num works for typical single-data-track
+		// CDs (where data_num always lands on track 0) but fails on
+		// multi-data-track CHDs like Cannon Fodder CD32: the data_num picker
+		// at line 360 has no break and ends up on the LAST data track, whose
+		// chd_offset (~ -223 unsigned wrap) then breaks every read for the
+		// FIRST data track.
 		uint32_t chd_lba = lba + track->chd_offset;
 		uint16_t sz = track->sectorSize;
 
@@ -1192,7 +1192,7 @@ int cdrom_read_raw_sector(drive_t *drive, uint32_t lba, uint8_t *buf)
 
 		if (sz == BYTES_PER_COOKED_REDBOOK_FRAME)
 		{
-			// Phase 26: cooked MODE1 CHD frame stores user data at offset 0;
+			// Cooked MODE1 CHD frame stores user data at offset 0;
 			// synthesize the 12-byte sync + 4-byte MSF/mode header so the
 			// BIOS sees a real raw 2352-byte frame.
 			memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
@@ -1889,7 +1889,7 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 		if (!res) res = load_iso_file(&ide_inst[num].drive[drv], path);
 	}
 
-	// Phase 32.5.1: notify the CD32 Akiko bridge of the new CD image so
+	// Notify the CD32 Akiko bridge of the new CD image so
 	// it can pick the right per-game NVRAM save slot. No-op for non-Minimig
 	// cores (the akiko poll only runs from user_io.cpp's Minimig branch),
 	// but the path-tracking state is harmless for them. Pass empty path on
