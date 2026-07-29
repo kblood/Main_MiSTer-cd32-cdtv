@@ -17,6 +17,8 @@
 #include "minimig_fdd.h"
 #include "minimig_config.h"
 #include "minimig_share.h"
+#include "../arcade/mra_loader.h"
+#include <string>
 #include "minimig_a2065.h"
 
 const char *config_memory_chip_msg[] = { "512K", "1M",   "1.5M", "2M" };
@@ -291,6 +293,159 @@ int minimig_cfg_save(int num)
 	// beside the config slot rather than inside the size-checked blob.
 	a2065_cfg_save(num);
 	return FileSaveConfig(GetConfigurationName(num, 0), &minimig_config, sizeof(minimig_config));
+}
+
+// ---- MGL surgical save ----
+// Updates the launching MGL's <file type="f"> entries to reflect df[] state.
+// - Mounted slot, no MGL line  -> append new <file delay=... type="f" index="N" path="..."/>
+// - Mounted slot, MGL line with different path -> rewrite the path attribute in place
+// - Ejected slot, MGL line     -> rewrite path="" (preserves any delay etc.)
+// - All other lines (rbf, setname, reset, comments, savestate items, etc.) untouched.
+
+static bool mgl_find_attr(const std::string &xml, size_t tag_start, size_t tag_end,
+                          const char *name, std::string &out_val,
+                          size_t *out_vstart = nullptr, size_t *out_vend = nullptr)
+{
+	size_t nlen = strlen(name);
+	for (size_t p = tag_start; p + nlen + 2 < tag_end; p++)
+	{
+		bool ws_before = (p == tag_start) || isspace((unsigned char)xml[p - 1]);
+		if (!ws_before) continue;
+		if (strncasecmp(xml.data() + p, name, nlen) != 0) continue;
+		if (xml[p + nlen] != '=' || xml[p + nlen + 1] != '"') continue;
+
+		size_t vs = p + nlen + 2;
+		size_t ve = xml.find('"', vs);
+		if (ve == std::string::npos || ve > tag_end) return false;
+		out_val.assign(xml, vs, ve - vs);
+		if (out_vstart) *out_vstart = vs;
+		if (out_vend)   *out_vend   = ve;
+		return true;
+	}
+	return false;
+}
+
+static void mgl_replace_path(std::string &xml, size_t tag_start, size_t &tag_end,
+                             const std::string &newval)
+{
+	std::string oldval;
+	size_t vs = 0, ve = 0;
+	if (mgl_find_attr(xml, tag_start, tag_end, "path", oldval, &vs, &ve))
+	{
+		xml.replace(vs, ve - vs, newval);
+		tag_end += (ssize_t)newval.size() - (ssize_t)(ve - vs);
+		return;
+	}
+	size_t ip = tag_end;
+	if (ip > 0 && xml[ip - 1] == '/') ip--;
+	while (ip > 0 && isspace((unsigned char)xml[ip - 1])) ip--;
+	std::string ins = " path=\"";
+	ins += newval;
+	ins += "\"";
+	xml.insert(ip, ins);
+	tag_end += ins.size();
+}
+
+int minimig_mgl_save()
+{
+	mgl_struct *m = mgl_get();
+	if (!m || !m->xml_path[0]) return 0;
+
+	const char *path = m->xml_path;
+	FILE *f = fopen(path, "rb");
+	if (!f) { printf("MGL save: cannot read %s\n", path); return 0; }
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (sz <= 0 || sz > (1 << 20)) { fclose(f); return 0; }
+	std::string xml((size_t)sz, '\0');
+	if (fread(&xml[0], 1, sz, f) != (size_t)sz) { fclose(f); return 0; }
+	fclose(f);
+
+	bool dirty = false;
+
+	for (int slot = 0; slot < 4; slot++)
+	{
+		bool mounted = (df[slot].status & DSK_INSERTED) != 0;
+		const char *cur_c = df[slot].name;
+		std::string target = mounted ? (cur_c ? cur_c : "") : "";
+
+		size_t found_start = std::string::npos;
+		size_t found_end   = std::string::npos;
+		std::string existing_path;
+		size_t scan = 0;
+		while (true)
+		{
+			size_t tag = xml.find("<file", scan);
+			if (tag == std::string::npos) break;
+			size_t te = xml.find('>', tag);
+			if (te == std::string::npos) break;
+
+			std::string vtype, vindex, vpath;
+			bool ht = mgl_find_attr(xml, tag, te, "type",  vtype);
+			bool hi = mgl_find_attr(xml, tag, te, "index", vindex);
+			mgl_find_attr(xml, tag, te, "path", vpath);
+
+			if (ht && hi && (vtype == "f" || vtype == "F") && atoi(vindex.c_str()) == slot)
+			{
+				found_start = tag;
+				found_end   = te;
+				existing_path = vpath;
+				break;
+			}
+			scan = te + 1;
+		}
+
+		if (found_start != std::string::npos)
+		{
+			if (existing_path != target)
+			{
+				mgl_replace_path(xml, found_start, found_end, target);
+				dirty = true;
+			}
+		}
+		else if (mounted)
+		{
+			size_t close = xml.find("</mistergamedescription>");
+			if (close == std::string::npos) continue;
+			size_t ln = xml.rfind('\n', close);
+			std::string indent = "    ";
+			if (ln != std::string::npos)
+			{
+				size_t a = ln + 1, b = a;
+				while (b < close && (xml[b] == ' ' || xml[b] == '\t')) b++;
+				if (b > a) indent.assign(xml, a, b - a);
+			}
+			char buf[1200];
+			int delay = (slot == 0) ? 2 : 0;
+			snprintf(buf, sizeof(buf),
+				"%s<file delay=\"%d\" type=\"f\" index=\"%d\" path=\"%s\"/>\n",
+				indent.c_str(), delay, slot, cur_c ? cur_c : "");
+			xml.insert(close, buf);
+			dirty = true;
+		}
+	}
+
+	if (!dirty)
+	{
+		printf("MGL save: no floppy deltas (path=%s)\n", path);
+		return 0;
+	}
+
+	char tmp[1100];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *out = fopen(tmp, "wb");
+	if (!out) { printf("MGL save: cannot create %s\n", tmp); return 0; }
+	size_t wrote = fwrite(xml.data(), 1, xml.size(), out);
+	fclose(out);
+	if (wrote != xml.size() || rename(tmp, path) != 0)
+	{
+		printf("MGL save: write/rename failed for %s\n", path);
+		unlink(tmp);
+		return 0;
+	}
+	printf("MGL save: updated %s (%zu bytes)\n", path, xml.size());
+	return 1;
 }
 
 const char* minimig_get_cfg_info(int num, int label)

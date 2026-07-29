@@ -1434,6 +1434,7 @@ static int scan_mgl(XMLEvent evt, const XMLNode* node, SXML_CHAR* text, const in
 mgl_struct* mgl_parse(const char *xml)
 {
 	memset(&mgl, 0, sizeof(mgl));
+	snprintf(mgl.xml_path, sizeof(mgl.xml_path), "%s", xml ? xml : "");
 
 	printf("MGL %s\n", xml);
 
