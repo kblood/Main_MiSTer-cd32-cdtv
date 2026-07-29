@@ -41,17 +41,13 @@
 // -----------------------------------------------------------------------------
 static void cdtv_diag(const char *fmt, ...)
 {
-	FILE *f = fopen("/tmp/cdtv_dbg.log", "a");
-	if (!f) return;
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	fprintf(f, "[%6lu.%06lu] ", (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000));
+	printf("[%6lu.%06lu] ", (unsigned long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000));
 	va_list ap; va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
+	vprintf(fmt, ap);
 	va_end(ap);
-	fputc('\n', f);
-	fflush(f);
-	fclose(f);
+	putchar('\n');
 }
 
 #define CDTV_DEBUG 1
@@ -73,10 +69,6 @@ static void cdtv_diag(const char *fmt, ...)
 // Phase-1e STCH-inject sub-channel: io_din[6]=1 inside the CDTV class
 // (hps_ext.v cdtv_cs_stch). Any byte written here pulses cdtv_bridge.stch.
 #define CDTV_STCH_ADDR     0xF840
-// Phase-1g trace-ring drain sub-channel: io_din[7]=1. Reads return 9 bytes
-// per entry: 8 LSB-first payload bytes + a valid marker (0xFF=real, 0x00=
-// ring empty). See cdtv_trace.v for the 64-bit entry layout.
-#define CDTV_TRACE_ADDR    0xF880
 // CDDA audio FIFO sub-channel — shared with akiko_cd32.cpp Phase 33.
 // hps_ext.v:191 selects cdda_cs on io_din[15:9] == 7'b1111001 → 0xF200.
 // Each spi_w pushes a 16-bit sample (high byte first for L/R alternation).
@@ -237,94 +229,18 @@ static void cdtv_inject_stch(void)
 	cdtv_dbg("STCH inject");
 }
 
-// Phase-1g trace drain. Pulls all available entries from the bridge ring
-// and logs them as decoded lines. Tag table mirrors cdtv_bridge.v:706-720.
-static const char *cdtv_trace_tag_name(uint8_t tag7)
+// Poll the STCH ack flag on the STCH sub-channel. The bridge sets it when the
+// BIOS INT2 handler reads the TPI AIR register and the active source is STCH,
+// i.e. the status change was delivered AND taken; the read clears it.
+static bool cdtv_stch_acked(void)
 {
-	switch (tag7 & 0x7F) {
-		case 0x01: return "ISTR";
-		case 0x02: return "CNTR";
-		case 0x03: return "WTC_hi";
-		case 0x04: return "WTC_lo";
-		case 0x05: return "ACR_hi";
-		case 0x06: return "ACR_lo";
-		case 0x07: return "DAWR";
-		case 0x08: return "AC_ROM";
-		case 0x09: return "CMDA";
-		case 0x0A: return "TPI";
-		case 0x0B: return "DMA_start";
-		case 0x0C: return "DMA_stop";
-		case 0x0D: return "ISTR_clr";
-		case 0x0E: return "FIFO_tog";
-		case 0x0F: return "other";
-		default:   return "??";
-	}
-}
-
-static FILE *cdtv_trace_fp = NULL;
-static int   cdtv_trace_count = 0;
-#define CDTV_TRACE_MAX_ENTRIES 20000
-
-static void cdtv_drain_trace(void)
-{
-	// ALWAYS drain the ring (so it can't overflow) and scan for the STCH ack
-	// even after file logging is capped — the play-end retry termination
-	// depends on seeing the AIR read. Only the /tmp file WRITE is bounded by
-	// CDTV_TRACE_MAX_ENTRIES; the SPI drain + ack scan run unconditionally.
-	//
-	// Pull entries in a loop until the ring drains. Each entry is 8 payload
-	// bytes + 1 valid marker. Cap iterations per poll so a runaway ring
-	// doesn't lock the loop.
-	for (int e = 0; e < 64; e++) {
-		uint8_t buf[8];
-		EnableIO();
-		spi8(UIO_DMA_READ);
-		spi32_w(CDTV_TRACE_ADDR);
-		for (int i = 0; i < 8; i++) buf[i] = (uint8_t)spi_w(0);
-		uint8_t valid = (uint8_t)spi_w(0);
-		DisableIO();
-		if (valid != 0xFF) break;   // ring empty
-
-		// 64-bit entry: [byte_off:16 | din:8 | tag:8 | ts:32] LSB-first
-		uint16_t off  = (uint16_t)(buf[0] | (buf[1] << 8));
-		uint8_t  din  = buf[2];
-		uint8_t  tag  = buf[3];
-		uint32_t ts   = (uint32_t)(buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24));
-
-		// WinUAE do_stch parity: terminate the play-end STCH retry the moment
-		// the BIOS INT2 handler reads the TPI AIR register and the active
-		// source is STCH (0x04) — i.e. the status-change was delivered AND
-		// taken. Stopping here (vs the old blind heartbeat) avoids re-firing
-		// INT2 into the next screen.
-		if (stch_wait_ack && !(tag & 0x80) /*RD*/ &&
-		    (tag & 0x7F) == 0x0A /*TPI*/ &&
-		    off == CDTV_AIR_BYTE_OFF && din == CDTV_AIR_CODE_STCH) {
-			stch_wait_ack = false;
-			stch_retries  = 0;
-			cdtv_dbg("STCH play-end ACKed (AIR=0x%02x) — retry stopped", din);
-		}
-
-		if (cdtv_trace_count < CDTV_TRACE_MAX_ENTRIES) {
-			if (!cdtv_trace_fp) {
-				cdtv_trace_fp = fopen("/tmp/cdtv_trace.log", "a");
-			}
-			if (cdtv_trace_fp) {
-				fprintf(cdtv_trace_fp,
-					"t=%u %s %s off=%04x data=%02x\n",
-					ts,
-					(tag & 0x80) ? "WR" : "RD",
-					cdtv_trace_tag_name(tag),
-					off, din);
-				fflush(cdtv_trace_fp);
-			}
-			cdtv_trace_count++;
-			if (cdtv_trace_count >= CDTV_TRACE_MAX_ENTRIES && cdtv_trace_fp) {
-				fprintf(cdtv_trace_fp, "[trace file capped at %d entries; ring drain continues]\n",
-					CDTV_TRACE_MAX_ENTRIES);
-				fflush(cdtv_trace_fp);
-			}
-		}
-	}
+	uint16_t v;
+	EnableIO();
+	spi8(UIO_DMA_READ);
+	spi32_w(CDTV_STCH_ADDR);
+	v = (uint16_t)spi_w(0);
+	DisableIO();
+	return (v & 1) != 0;
 }
 
 // Push a reply payload (already including any STCH-trigger byte sequencing the
@@ -492,7 +408,7 @@ static bool cdtv_cdda_pump(void)
 		// PLAY_COMPLETE so any future loop-detection logic can re-arm.
 		cdtv_inject_stch();
 		// WinUAE do_stch parity (cdtv.cpp:1292): retry the play-end STCH until
-		// the BIOS INT2 handler TAKES it (cdtv_drain_trace sees AIR==0x04),
+		// the BIOS INT2 handler TAKES it (the bridge sets stch_ack),
 		// then stop. A single pulse is lost to the scor/sten interrupt churn
 		// (HW trace: seg-2/map STCH dropped → map stall); the old blind 60 s
 		// heartbeat over-injected → credits stall. Ack-terminated retry fixes
@@ -1140,7 +1056,7 @@ void cdtv_cd_init(void)
 	// behaviour: bit 0 of STATUS is always 1"). Our prior cd_isready=cd_media
 	// gave STATUS reply 0x40 (bit 0 clear, "invalid status"), after which the
 	// CDTV BIOS issued one $81, accepted the 0x40 byte over STEN, then stopped
-	// dispatching commands — observed in cdtv_trace_phase1h_v2.log. Match
+	// dispatching commands. Match
 	// WinUAE: leave cd_isready=0 so STATUS reply is 0x41 when media present.
 	cd_isready    = 0;
 	cd_playing    = 0;
@@ -1185,9 +1101,13 @@ void cdtv_cd_poll(void)
 	// share the same SPI cmd 0x63 the CR-511 dispatch already uses.
 	cdtv_cdda_pump();
 
-	// Phase-1g: drain trace ring on every poll so /tmp/cdtv_trace.log
-	// reflects current BIOS bus activity. Each entry is 9 SPI reads.
-	cdtv_drain_trace();
+	// Terminate the play-end STCH retry the moment the BIOS takes the
+	// interrupt. See the arm site in the CDDA end-of-play handler.
+	if (stch_wait_ack && cdtv_stch_acked()) {
+		stch_wait_ack = false;
+		stch_retries  = 0;
+		cdtv_dbg("STCH play-end ACKed — retry stopped");
+	}
 
 	// Drain whatever cmd bytes the bridge has accumulated this tick. The
 	// status word's bit 6 (cdtv_req) tracks ~cmd_in_empty in the bridge,

@@ -187,7 +187,7 @@ char *user_io_get_core_path(const char *suffix, int recheck)
 	static char tmp[1024] = {};
 	char *name = (ovr_name[0] && ovr_samedir) ? orig_name : core_name;
 
-	if (!suffix) suffix = (!strncasecmp(name, "minimig", 7)) ? "Amiga" : name;
+	if (!suffix) suffix = (!strcasecmp(name, "minimig")) ? "Amiga" : name;
 	if (recheck || strcmp(old_name, suffix) || !tmp[0])
 	{
 		strcpy(old_name, suffix);
@@ -260,9 +260,7 @@ char is_neogeo_cd() {
 static int is_minimig_type = 0;
 char is_minimig()
 {
-	// Prefix-match so renamed CONF_STR variants ("MinimigCD" for our CD32+CDTV
-	// fork, etc.) still satisfy the Minimig-specific code paths gated below.
-	if (!is_minimig_type) is_minimig_type = strncasecmp(orig_name, "minimig", 7) ? 2 : 1;
+	if (!is_minimig_type) is_minimig_type = strcasecmp(orig_name, "minimig") ? 2 : 1;
 	return (is_minimig_type == 1);
 }
 

@@ -35,8 +35,6 @@
 #include "str_util.h"
 #include "frame_timer.h"
 #include "scaler.h"
-#include "ide.h"
-#include "support/minimig/minimig_config.h"
 
 #define NUMDEV 30
 #define UINPUT_NAME "MiSTer virtual input"
@@ -5919,33 +5917,6 @@ int input_test(int getchar)
 						if (!strcmp(cmd + 7, "mute")) set_volume(0x81);
 						else if (!strcmp(cmd + 7, "unmute")) set_volume(0x80);
 						else if (cmd[7] >= '0' && cmd[7] <= '7') set_volume(0x40 - 0x30 + cmd[7]);
-					}
-					else if (!strncmp(cmd, "mount_cd ", 9))
-					{
-						// CD32-fork test hook: mount a CHD/ISO/CUE on IDE slot 0
-						// (CD32 CD bay) without OSD navigation. Used to verify
-						// the mediachange path (boot-with-no-CD-then-mount).
-						const char *path = cmd + 9;
-						while (*path == ' ' || *path == '\t') path++;
-						{
-							size_t maxlen = sizeof(minimig_config.hardfile[0].filename) - 1;
-							size_t plen = strlen(path);
-							if (plen > maxlen) plen = maxlen;
-							if (plen) memcpy(minimig_config.hardfile[0].filename, path, plen);
-							minimig_config.hardfile[0].filename[plen] = 0;
-						}
-						int rc = ide_open(0, path);
-						printf("MiSTer_cmd: mount_cd unit=0 path=\"%s\" rc=%d\n", path, rc);
-					}
-					else if (!strcmp(cmd, "unmount_cd") || !strncmp(cmd, "unmount_cd ", 11))
-					{
-						// CD32-fork test hook: mirrors OSD-unmount path exactly
-						// (clears minimig_config.hardfile[0].filename; does NOT
-						// call ide_open). The IDE drive state stays open until
-						// the next minimig_reset() / ApplyConfiguration runs
-						// hdd_open(0) → ide_open(0, "") → cleanup.
-						minimig_config.hardfile[0].filename[0] = 0;
-						printf("MiSTer_cmd: unmount_cd (cleared hardfile[0].filename, IDE state untouched)\n");
 					}
 				}
 			}

@@ -281,11 +281,6 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	//TODO: abstract all the bin/cue+chd+iso parsing and reading into a shared class
 	//
 
-	{
-		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
-		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file enter: chdfile=%s\n", chdfile ? chdfile : "(null)"); fclose(_f); }
-	}
-
 	const char *ext = chdfile + strlen(chdfile) - 4;
 	uint32_t total_sector_size = 0;
 
@@ -293,18 +288,12 @@ static const char* load_chd_file(drive_t *drv, const char *chdfile)
 	if (strncasecmp(".chd", ext, 4))
 	{
 		//Not a CHD
-		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
-		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file: ext mismatch '%s'\n", ext); fclose(_f); }
 		return 0;
 	}
 	toc_t tmpTOC = { };
 	memset(drv->track, 0, sizeof(drv->track));
 	drv->track_cnt = 0;
 	chd_error err = mister_load_chd(chdfile, &tmpTOC);
-	{
-		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
-		if (_f) { fprintf(_f, "[ide_cdrom] load_chd_file: mister_load_chd err=%d (%s) tracks=%d\n", err, err==CHDERR_NONE?"OK":"FAIL", tmpTOC.last); fclose(_f); }
-	}
 	if (err != CHDERR_NONE)
 	{
 		return 0;
@@ -1867,8 +1856,6 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 		// expects an absolute path — match the cold-load path's getFullPath
 		// behaviour rather than returning the relative input filename.
 		const char *full = getFullPath(filename);
-		FILE *_f = fopen("/tmp/akiko_dbg.log", "a");
-		if (_f) { fprintf(_f, "[ide_cdrom] cdrom_parse: idempotent re-mount of %s (full=%s) — keeping CHD open\n", filename, full); fclose(_f); }
 		ide_inst[num].drive[drv].mcr_flag = true;
 		ide_inst[num].drive[drv].playing = 0;
 		ide_inst[num].drive[drv].paused = 0;
