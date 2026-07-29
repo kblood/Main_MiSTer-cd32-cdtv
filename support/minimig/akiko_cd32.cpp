@@ -2149,6 +2149,9 @@ static void akiko_diag(const char *fmt, ...)
 	vprintf(fmt, ap);
 	va_end(ap);
 	putchar('\n');
+	// Line-flush: stdout is block-buffered when redirected to a file, so
+	// without this a debug=1 capture lags the hardware by a whole buffer.
+	fflush(stdout);
 }
 
 void akiko_cd32_poll(void)
