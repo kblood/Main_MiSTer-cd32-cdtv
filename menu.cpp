@@ -6013,7 +6013,14 @@ void HandleUI(void)
 	case MENU_MINIMIG_ADFFILE_SELECTED:
 		if (!mgl->done)
 		{
-			snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), mgl->item[mgl->current].path);
+			// A path may be absolute, or start with "../" to reach outside the
+			// core's own games folder -- an MGL that mounts an image from a
+			// shared library directory or a USB mount needs both. Only a bare
+			// relative path is resolved against HomeDir() as before.
+			const char *p = mgl->item[mgl->current].path;
+			if (p[0] == '/') snprintf(selPath, sizeof(selPath), "%s", p);
+			else if (p[0] == '.' && p[1] == '.') snprintf(selPath, sizeof(selPath), "%s/%s", getRootDir(), p);
+			else snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), p);
 			// Update /tmp/ files to reflect the actual file being loaded by MGL
 			if (cfg.log_file_entry)
 			{
