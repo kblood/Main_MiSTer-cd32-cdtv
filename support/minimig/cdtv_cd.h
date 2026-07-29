@@ -1,4 +1,4 @@
-// CDTV native-mode bridge host driver — M2 phase-1c.
+// CDTV native-mode bridge host driver.
 // Mirrors the CR-511 command interpreter in WinUAE cdtv.cpp:524-695 just
 // far enough to boot a CDTV title past the Welcome splash. Only fires
 // when the active Minimig CFG has CONFIG_CDTV set (other modes are no-ops).

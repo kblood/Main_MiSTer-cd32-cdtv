@@ -4,7 +4,7 @@
 void akiko_cd32_init(void);
 void akiko_cd32_poll(void);
 
-// Phase 32.5.1 — per-game NVRAM. Called from ide_cdrom.cpp::cdrom_parse
+// Per-game NVRAM. Called from ide_cdrom.cpp::cdrom_parse
 // whenever a CD image is mounted or unmounted on a Minimig CD slot. `path`
 // is the full filesystem path of the CHD/CUE/ISO; pass an empty string on
 // unmount. The basename is hashed (FNV-1a 64-bit) into a per-game save
