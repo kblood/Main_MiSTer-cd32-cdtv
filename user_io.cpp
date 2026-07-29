@@ -34,6 +34,8 @@
 #include "shmem.h"
 #include "ide.h"
 #include "ide_cdrom.h"
+#include "support/minimig/akiko_cd32.h"
+#include "support/minimig/cdtv_cd.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -3174,6 +3176,11 @@ void user_io_poll()
 		ide_io(1, (sd_req >> 3) & 7);
 		if (sd_req & 0x0100) ide_cdda_send_sector();
 		UpdateDriveStatus();
+		if (is_amigacd())
+		{
+			akiko_cd32_poll();
+			cdtv_cd_poll();
+		}
 
 		kbd_fifo_poll();
 
@@ -3198,8 +3205,14 @@ void user_io_poll()
 	{
 		x86_poll(0);
 	}
-	else if ((core_type == CORE_TYPE_8BIT) && !is_menu() && !is_minimig())
+	else if ((core_type == CORE_TYPE_8BIT) && !is_menu() && (!is_minimig() || is_amigacd()))
 	{
+		// AmigaCD participates in SD-block polling for the CD32 NVRAM .nvr
+		// load path (hps_io VDNUM=1, BLKSZ=3 → slot 0 = 1 KiB NVR). The
+		// per-core sub-pollers below are all gated by their own is_<core>()
+		// checks and skip it naturally; the for-loop's generic SD-request
+		// handler then services sd_rd[0] when the Akiko NVRAM FSM raises it
+		// on img_mounted. Plain Minimig stays excluded exactly as before.
 		if (is_st()) tos_poll();
 		if (is_snes() || is_sgb()) snes_poll();
 		mdplus_poll(); // MD+ CDDA poll
