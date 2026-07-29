@@ -466,8 +466,23 @@ static const char* load_cue_file(drive_t *drv, const char *cuefile)
 			else success = 1;
 			canAddTrack = 0;
 
+			// Quoted form first: FILE "name with spaces.bin" BINARY. Some
+			// writers leave the quotes off when the name has no spaces, and
+			// the paired getline() then yields an empty name. get_word() is
+			// not usable as the fallback: it uppercases, which breaks
+			// case-sensitive filenames.
 			std::string filename;
-			std::getline(std::getline(line, filename, '"'), filename, '"');
+			std::string leading;
+			std::getline(line, leading, '"');
+			if (line.good())
+			{
+				std::getline(line, filename, '"');
+			}
+			else
+			{
+				std::istringstream toks(leading);
+				toks >> filename;
+			}
 
 			strcpy(track.filename, pathname.c_str());
 			strcat(track.filename, filename.c_str());
