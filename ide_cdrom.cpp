@@ -476,10 +476,14 @@ static const char* load_cue_file(drive_t *drv, const char *cuefile)
 			std::getline(line, leading, '"');
 			if (line.good())
 			{
+				// Leading getline consumed up to the opening quote; read
+				// up to the closing one.
 				std::getline(line, filename, '"');
 			}
 			else
 			{
+				// No quote was present; the leading getline drained the
+				// rest of the line. Re-tokenize on whitespace.
 				std::istringstream toks(leading);
 				toks >> filename;
 			}
@@ -1116,7 +1120,129 @@ void cdrom_read(ide_config *ide)
 	pkt_send(ide, ide_buf, cnt * 2048);
 }
 
-static int disc_info(drive_t *drv, uint16_t maxlen) 
+// Read one full 2352-byte raw sector from the CD image at `lba` into `buf`.
+// Used by the Akiko PBX sector DMA path. Returns 0 on success, -1 on error.
+//
+// Source-format handling:
+//   - CHD              : per-track sectorSize: 2352 = flat copy; 2336 = zero
+//                        16-byte sync+header then read 2336 into buf+16; 2048
+//                        = synth Mode 1 sync header then read 2048 into buf+16.
+//                        CHD only stores raw 2352 for MODE1_RAW/MODE2_RAW; for
+//                        cooked MODE1/MODE2 the CHD frame holds only the user
+//                        bytes (offset 0 of the 2448 frame), so a flat 2352
+//                        copy gives the BIOS user-data-where-sync-should-be.
+//   - 2352-byte BIN/ISO: FileSeek + read, no transform.
+//   - 2336-byte (Mode2): zero the 16-byte sync+header, copy 2336 into buf+16.
+//   - 2048-byte cooked : minimal Mode 1 sync header + 2048 user data + zero
+//                        ECC. CD32 doesn't validate ECC so this works for
+//                        booting; games that rely on raw sector contents
+//                        (rare on CD32) won't.
+int cdrom_read_raw_sector(drive_t *drive, uint32_t lba, uint8_t *buf)
+{
+	if (!drive || !buf) return -1;
+
+	bool is_index0 = false;
+	track_t *track = get_track_from_lba(drive, lba, is_index0);
+	if (!track) return -1;
+
+	if (drive->chd_f)
+	{
+		// Per-track chd_offset, not data_num's. mister_chd.cpp derives it per
+		// track because CHD pads each track up to a multiple of four sectors,
+		// so the disc-LBA to CHD-LBA delta differs from one track to the next.
+		uint32_t chd_lba = lba + track->chd_offset;
+		uint16_t sz = track->sectorSize;
+
+		if (sz == BYTES_PER_RAW_REDBOOK_FRAME)
+		{
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 0, 0,
+			                           BYTES_PER_RAW_REDBOOK_FRAME, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		if (sz == 2336)
+		{
+			memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 16, 0,
+			                           2336, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		if (sz == BYTES_PER_COOKED_REDBOOK_FRAME)
+		{
+			// Cooked MODE1 CHD frame stores user data at offset 0;
+			// synthesize the 12-byte sync + 4-byte MSF/mode header so the
+			// BIOS sees a real raw 2352-byte frame.
+			memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+			buf[0] = 0x00;
+			memset(buf + 1, 0xff, 10);
+			buf[11] = 0x00;
+			uint32_t f_lba = lba + REDBOOK_FRAME_PADDING;
+			uint8_t mm = (uint8_t)(f_lba / (REDBOOK_FRAMES_PER_SECOND * 60));
+			uint8_t ss = (uint8_t)((f_lba / REDBOOK_FRAMES_PER_SECOND) % 60);
+			uint8_t ff = (uint8_t)(f_lba % REDBOOK_FRAMES_PER_SECOND);
+			buf[12] = (uint8_t)(((mm / 10) << 4) | (mm % 10));
+			buf[13] = (uint8_t)(((ss / 10) << 4) | (ss % 10));
+			buf[14] = (uint8_t)(((ff / 10) << 4) | (ff % 10));
+			buf[15] = 0x01;
+			if (mister_chd_read_sector(drive->chd_f, chd_lba, 16, 0,
+			                           BYTES_PER_COOKED_REDBOOK_FRAME, buf,
+			                           drive->chd_hunkbuf, &drive->chd_hunknum)
+			    != CHDERR_NONE) return -1;
+			return 0;
+		}
+
+		return -1;
+	}
+
+	if (!track->f.opened()) return -1;
+
+	uint16_t sz = track->sectorSize;
+	uint32_t pos = track->skip + (lba - track->start) * sz;
+	if (FileSeek(&track->f, pos, SEEK_SET) < 0) return -1;
+
+	if (sz == BYTES_PER_RAW_REDBOOK_FRAME)
+	{
+		if (FileReadAdv(&track->f, buf, BYTES_PER_RAW_REDBOOK_FRAME, -1) <= 0)
+			return -1;
+		return 0;
+	}
+
+	if (sz == 2336)
+	{
+		memset(buf, 0, 16);
+		if (FileReadAdv(&track->f, buf + 16, 2336, -1) <= 0) return -1;
+		return 0;
+	}
+
+	if (sz == BYTES_PER_COOKED_REDBOOK_FRAME)
+	{
+		// Synthesize minimal Mode 1 raw frame: sync(12) + header(4) + data + ECC(0).
+		memset(buf, 0, BYTES_PER_RAW_REDBOOK_FRAME);
+		buf[0] = 0x00;
+		memset(buf + 1, 0xff, 10);
+		buf[11] = 0x00;
+		// header MSF (BCD) + mode (=1)
+		uint32_t f_lba = lba + REDBOOK_FRAME_PADDING;
+		uint8_t mm = (uint8_t)(f_lba / (REDBOOK_FRAMES_PER_SECOND * 60));
+		uint8_t ss = (uint8_t)((f_lba / REDBOOK_FRAMES_PER_SECOND) % 60);
+		uint8_t ff = (uint8_t)(f_lba % REDBOOK_FRAMES_PER_SECOND);
+		buf[12] = (uint8_t)(((mm / 10) << 4) | (mm % 10));
+		buf[13] = (uint8_t)(((ss / 10) << 4) | (ss % 10));
+		buf[14] = (uint8_t)(((ff / 10) << 4) | (ff % 10));
+		buf[15] = 0x01;
+		if (FileReadAdv(&track->f, buf + 16, 2048, -1) <= 0) return -1;
+		return 0;
+	}
+
+	return -1;
+}
+
+static int disc_info(drive_t *drv, uint16_t maxlen)
 {
 	if (!maxlen) return 0;
 	if (maxlen > 34) maxlen = 34;
@@ -1698,6 +1824,38 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	int drv = num & 1;
 	num >>= 1;
 
+	// Remember the last path mounted per (controller, drive) so an idempotent
+	// re-mount can short-circuit. minimig_reset() → ApplyConfiguration →
+	// hdd_open → ide_open → cdrom_parse re-runs on every in-core OSD reset
+	// and closed/re-opened the CHD even for the same file. That tear-down
+	// dropped the chd_file* parser, freed the hunkbuf (forcing a cold zlib
+	// re-decode of the first hunk on the next read) and lost the kernel
+	// readahead state for the fd, so every sector of the reboot came off cold
+	// parser state — a reset took twice as long to reach the same point as the
+	// first boot. Holding the CHD open preserves both the parser and the OS
+	// page cache for the descriptor.
+	static char last_path[2][2][1024] = {};
+	const char *cmp_filename = filename ? filename : "";
+	bool same_path = filename && filename[0]
+	                 && !strcmp(last_path[num][drv], cmp_filename)
+	                 && ide_inst[num].drive[drv].chd_f != NULL;
+
+	if (same_path) {
+		// Idempotent re-mount: same CHD already open. Reset only the transient
+		// playback state and re-notify the Akiko bridge so per-game NVRAM
+		// stays correct. Skip cdrom_close_chd / track close / reload entirely.
+		// Caller (ide_open) passes our return value to ide_img_mount, which
+		// expects an absolute path — match the cold-load path's getFullPath
+		// behaviour rather than returning the relative input filename.
+		const char *full = getFullPath(filename);
+		ide_inst[num].drive[drv].mcr_flag = true;
+		ide_inst[num].drive[drv].playing = 0;
+		ide_inst[num].drive[drv].paused = 0;
+		ide_inst[num].drive[drv].play_start_lba = 0;
+		ide_inst[num].drive[drv].play_end_lba = 0;
+		return full;
+	}
+
 	//always close files and reset state. empty filename == unmounted cd from OSD
 	cdrom_close_chd(&ide_inst[num].drive[drv]);
 	for (uint8_t i = 0; i < sizeof(ide_inst[num].drive[drv].track) / sizeof(track_t); i++)
@@ -1712,13 +1870,32 @@ const char* cdrom_parse(uint32_t num, const char *filename)
 	ide_inst[num].drive[drv].paused = 0;
 	ide_inst[num].drive[drv].play_start_lba = 0;
 	ide_inst[num].drive[drv].play_end_lba = 0;
+	const char *path = NULL;
 	if (strlen(filename))
 	{
-		const char *path = getFullPath(filename);
+		path = getFullPath(filename);
 		res = load_chd_file(&ide_inst[num].drive[drv], path);
 		if (!res) res = load_cue_file(&ide_inst[num].drive[drv], path);
 		if (!res) res = load_iso_file(&ide_inst[num].drive[drv], path);
 	}
+
+	// Notify the CD32 Akiko bridge of the new CD image so
+	// it can pick the right per-game NVRAM save slot. No-op for non-Minimig
+	// cores (the akiko poll only runs from user_io.cpp's Minimig branch),
+	// but the path-tracking state is harmless for them. Pass empty path on
+	// unmount or on failed load so the bridge clears its active slot.
+	// load_*_file return the image name on success, NULL on failure.
+
+	// Remember what we mounted so the next call can short-circuit if it's
+	// the same image (see top of function). Empty/failed mounts clear it
+	// so a re-attempt actually re-runs the load path.
+	if (filename && filename[0] && res) {
+		strncpy(last_path[num][drv], cmp_filename, sizeof(last_path[0][0]) - 1);
+		last_path[num][drv][sizeof(last_path[0][0]) - 1] = '\0';
+	} else {
+		last_path[num][drv][0] = '\0';
+	}
+
 	return res;
 }
 
