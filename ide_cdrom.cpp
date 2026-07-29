@@ -1752,7 +1752,12 @@ void ide_cdda_send_sector()
 	{
 		if (drv->chd_f)
 		{
-			mister_chd_read_sector(drv->chd_f, drv->play_start_lba + drv->track[drv->data_num].chd_offset, 0, 0, BYTES_PER_RAW_REDBOOK_FRAME, cdda_buf, drv->chd_hunkbuf, &drv->chd_hunknum);
+			// CDDA reads belong to the audio track at play_start_lba -- not the
+			// data track at drv->data_num. CHD pads each track to a multiple of
+			// 4 sectors so chd_offset differs per track, and reading with the
+			// data track's offset returns the wrong samples (silence, noise, or
+			// a few seconds of data interpreted as audio depending on layout).
+			mister_chd_read_sector(drv->chd_f, drv->play_start_lba + track->chd_offset, 0, 0, BYTES_PER_RAW_REDBOOK_FRAME, cdda_buf, drv->chd_hunkbuf, &drv->chd_hunknum);
 			needs_swap = true;
 		}
 		else
