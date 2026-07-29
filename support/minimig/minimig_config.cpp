@@ -718,7 +718,9 @@ void minimig_ConfigMemory(unsigned char memory)
 
 void minimig_ConfigCPU(unsigned char cpu)
 {
-	spi_uio_cmd8(UIO_MM2_CPU, cpu & 0x1f);
+	// Bit 5 carries the stock-speed request, so the CPU byte is six bits
+	// wide now. userio.v masks it off on cores built without the throttle.
+	spi_uio_cmd8(UIO_MM2_CPU, cpu & 0x3f);
 }
 
 void minimig_ConfigChipset(unsigned char chipset)

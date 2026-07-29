@@ -6192,7 +6192,7 @@ void HandleUI(void)
 
 	case MENU_MINIMIG_CHIPSET1:
 		helptext_idx = HELPTEXT_CHIPSET;
-		menumask = 0x7FF;
+		menumask = 0xFFF;
 		OsdSetTitle("System");
 		parentstate = menustate;
 
@@ -6204,24 +6204,27 @@ void HandleUI(void)
 		strcpy(s, " D-Cache  : ");
 		strcat(s, (minimig_config.cpu & 16) ? "ON" : "OFF");
 		OsdWrite(m++, s, menusub == 1, !(minimig_config.cpu & 0x2));
+		strcpy(s, " CPU Speed: ");
+		strcat(s, (minimig_config.cpu & 0x20) ? "14 MHz" : "Full");
+		OsdWrite(m++, s, menusub == 2, !(minimig_config.cpu & 0x2));
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " Chipset  : ");
 		strcat(s, config_chipset_msg[(minimig_config.chipset >> 2) & 7]);
-		OsdWrite(m++, s, menusub == 2, 0);
+		OsdWrite(m++, s, menusub == 3, 0);
 		strcpy(s, " ChipRAM  : ");
 		strcat(s, config_memory_chip_msg[minimig_config.memory & 0x03]);
-		OsdWrite(m++, s, menusub == 3, 0);
+		OsdWrite(m++, s, menusub == 4, 0);
 		strcpy(s, " FastRAM  : ");
 		strcat(s, config_memory_fast_msg[(minimig_config.cpu >> 1) & 1][((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5)]);
-		OsdWrite(m++, s, menusub == 4, 0);
+		OsdWrite(m++, s, menusub == 5, 0);
 		strcpy(s, " SlowRAM  : ");
 		strcat(s, config_memory_slow_msg[(minimig_config.memory >> 2) & 0x03]);
-		OsdWrite(m++, s, menusub == 5, 0);
+		OsdWrite(m++, s, menusub == 6, 0);
 
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " Joystick : ");
 		strcat(s, config_joystick_mode[(minimig_config.autofire & 6) >> 1]);
-		OsdWrite(m++, s, menusub == 6, 0);
+		OsdWrite(m++, s, menusub == 7, 0);
 
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " ROM    : ");
@@ -6233,18 +6236,18 @@ void HandleUI(void)
 			strncat(&s[3], name, 24);
 		}
 
-		OsdWrite(m++, s, menusub == 7, 0);
+		OsdWrite(m++, s, menusub == 8, 0);
 		strcpy(s, " HRTmon : ");
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
-		OsdWrite(m++, s, menusub == 8, 0);
+		OsdWrite(m++, s, menusub == 9, 0);
 
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " Ethernet : ");
 		strcat(s, a2065_iface_msg(a2065_get_iface()));
-		OsdWrite(m++, s, menusub == 9, 0);
+		OsdWrite(m++, s, menusub == 10, 0);
 
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 10, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 11, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -6276,7 +6279,13 @@ void HandleUI(void)
 				minimig_config.cpu ^= 16;
 				minimig_ConfigCPU(minimig_config.cpu);
 			}
-			else if (menusub == 2)
+			else if (menusub == 2 && (minimig_config.cpu & 0x2))
+			{
+				minimig_config.cpu ^= 0x20;
+				menustate = MENU_MINIMIG_CHIPSET1;
+				minimig_ConfigCPU(minimig_config.cpu);
+			}
+			else if (menusub == 3)
 			{
 				if (minus)
 				{
@@ -6318,12 +6327,12 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 				minimig_ConfigChipset(minimig_config.chipset);
 			}
-			else if (menusub == 3)
+			else if (menusub == 4)
 			{
 				minimig_config.memory = ((minimig_config.memory + (minus ? -1 : 1)) & 0x03) | (minimig_config.memory & ~0x03);
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 4)
+			else if (menusub == 5)
 			{
 				int c = (((minimig_config.memory >> 4) & 0x03) | ((minimig_config.memory & 0x80) >> 5));
 				if (minus)
@@ -6341,12 +6350,12 @@ void HandleUI(void)
 				minimig_config.memory = ((c << 4) & 0x30) | ((c << 5) & 0x80) | (minimig_config.memory & ~0xB0);
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 5)
+			else if (menusub == 6)
 			{
 				minimig_config.memory = ((minimig_config.memory + (minus ? -4 : 4)) & 0x0C) | (minimig_config.memory & ~0x0C);
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 6)
+			else if (menusub == 7)
 			{
 				uint8_t x = (minimig_config.autofire & 6) >> 1;
 				if (minus)
@@ -6364,17 +6373,17 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 				minimig_ConfigAutofire(minimig_config.autofire, 6);
 			}
-			else if (menusub == 7 && select)
+			else if (menusub == 8 && select)
 			{
 				ioctl_index = 1;
 				SelectFile(Selected_F[4], "ROM", SCANO_DIR, MENU_MINIMIG_ROMFILE_SELECTED, MENU_MINIMIG_CHIPSET1);
 			}
-			else if (menusub == 8)
+			else if (menusub == 9)
 			{
 				minimig_config.memory ^= 0x40;
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 9)
+			else if (menusub == 10)
 			{
 				// A2065 ethernet: OFF -> eth0 -> eth1 -> macvlan -> tap0,
 				// skipping anything this box cannot support (no second NIC,
@@ -6390,7 +6399,7 @@ void HandleUI(void)
 				a2065_set_iface(m2);
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
-			else if (menusub == 10)
+			else if (menusub == 11)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 6;
