@@ -18,6 +18,11 @@
 #include "minimig_config.h"
 #include "minimig_share.h"
 #include "minimig_a2065.h"
+#include "akiko_cd32.h"
+#include "cdtv_cd.h"
+#include "../arcade/mra_loader.h"
+#include <string>
+#include <unistd.h>
 
 const char *config_memory_chip_msg[] = { "512K", "1M",   "1.5M", "2M" };
 const char *config_memory_slow_msg[] = { "none", "512K", "1M",   "1.5M" };
@@ -93,6 +98,97 @@ static void SendFileV2(fileTYPE* file, unsigned char* key, int keysize, int addr
 	printf("]\n");
 }
 
+
+// Ext-ROM path is stored piggybacked in minimig_config.kickstart[]
+// past the kickstart string's null terminator. Kept in the same field
+// to preserve the on-disk CFG binary layout (kickstart is at a fixed
+// offset; adding a sibling field would shift every later field and
+// break every existing per-game .cfg file).
+const char* minimig_get_extrom()
+{
+	const size_t cap = sizeof(minimig_config.kickstart);
+	size_t kicklen = strnlen(minimig_config.kickstart, cap);
+	if (kicklen + 1 >= cap) return "";
+	return &minimig_config.kickstart[kicklen + 1];
+}
+
+static void SendBufferV2(const uint8_t *buf, int address, int size_bytes)
+{
+	int sectors = size_bytes / 512;
+	printf("Upload %dkB -> 0x%08x [", size_bytes >> 10, address);
+	for (int i = 0; i < sectors; i++)
+	{
+		if (!(i & 31)) printf("*");
+		EnableIO();
+		unsigned int adr = address + i * 512;
+		spi8(UIO_MM2_WR);
+		spi8(adr & 0xff); adr >>= 8;
+		spi8(adr & 0xff); adr >>= 8;
+		spi8(adr & 0xff); adr >>= 8;
+		spi8(adr & 0xff); adr >>= 8;
+		const uint8_t *p = buf + i * 512;
+		for (int j = 0; j < 512; j += 4)
+		{
+			spi8(p[j + 0]);
+			spi8(p[j + 1]);
+			spi8(p[j + 2]);
+			spi8(p[j + 3]);
+		}
+		DisableIO();
+	}
+	printf("]\n");
+}
+
+// Load a ROM image into a 512K slot. Supports 256K (mirrored to 512K)
+// and 512K (direct). Returns true on success.
+static bool LoadRomSlot(const char *path, uint8_t *dst512k)
+{
+	fileTYPE file = {};
+	if (!FileOpen(&file, path)) {
+		printf("Ext-ROM open failed: %s\n", path);
+		return false;
+	}
+	int sz = file.size;
+	if (sz == 0x80000) {
+		FileReadAdv(&file, dst512k, 0x80000);
+	} else if (sz == 0x40000) {
+		FileReadAdv(&file, dst512k, 0x40000);
+		memcpy(dst512k + 0x40000, dst512k, 0x40000);
+	} else {
+		printf("Unsupported ROM size %d for slot upload\n", sz);
+		FileClose(&file);
+		return false;
+	}
+	FileClose(&file);
+	return true;
+}
+
+// Composite upload: ext-ROM in lower 512K, main Kickstart in upper 512K.
+// Mirrors the 1MB-image path used by the CD32 BIOS, but assembles the
+// two halves from separate files instead of a pre-baked concat.
+static char UploadKickstartWithExtRom(const char *kick_path, const char *extrom_path)
+{
+	BootPrint("Loading Kickstart + Ext.ROM:");
+	BootPrint(kick_path);
+	BootPrint(extrom_path);
+
+	static uint8_t img[0x100000];
+	memset(img, 0, sizeof(img));
+
+	if (!LoadRomSlot(extrom_path, img)) return 0;
+	if (!LoadRomSlot(kick_path,   img + 0x80000)) return 0;
+
+	// Discard residents (matches UploadKickstart pre-amble).
+	EnableIO();
+	spi8(UIO_MM2_WR);
+	for (int i = 0; i < 8; i++) spi8(0);
+	for (int i = 0; i < 4; i++) spi8(1);
+	DisableIO();
+
+	SendBufferV2(img,           0xe00000, 0x80000);
+	SendBufferV2(img + 0x80000, 0xf80000, 0x80000);
+	return 1;
+}
 
 static char UploadKickstart(char *name)
 {
@@ -293,6 +389,159 @@ int minimig_cfg_save(int num)
 	return FileSaveConfig(GetConfigurationName(num, 0), &minimig_config, sizeof(minimig_config));
 }
 
+// ---- MGL surgical save ----
+// Updates the launching MGL's <file type="f"> entries to reflect df[] state.
+// - Mounted slot, no MGL line  -> append new <file delay=... type="f" index="N" path="..."/>
+// - Mounted slot, MGL line with different path -> rewrite the path attribute in place
+// - Ejected slot, MGL line     -> rewrite path="" (preserves any delay etc.)
+// - All other lines (rbf, setname, reset, comments, savestate items, etc.) untouched.
+
+static bool mgl_find_attr(const std::string &xml, size_t tag_start, size_t tag_end,
+                          const char *name, std::string &out_val,
+                          size_t *out_vstart = nullptr, size_t *out_vend = nullptr)
+{
+	size_t nlen = strlen(name);
+	for (size_t p = tag_start; p + nlen + 2 < tag_end; p++)
+	{
+		bool ws_before = (p == tag_start) || isspace((unsigned char)xml[p - 1]);
+		if (!ws_before) continue;
+		if (strncasecmp(xml.data() + p, name, nlen) != 0) continue;
+		if (xml[p + nlen] != '=' || xml[p + nlen + 1] != '"') continue;
+
+		size_t vs = p + nlen + 2;
+		size_t ve = xml.find('"', vs);
+		if (ve == std::string::npos || ve > tag_end) return false;
+		out_val.assign(xml, vs, ve - vs);
+		if (out_vstart) *out_vstart = vs;
+		if (out_vend)   *out_vend   = ve;
+		return true;
+	}
+	return false;
+}
+
+static void mgl_replace_path(std::string &xml, size_t tag_start, size_t &tag_end,
+                             const std::string &newval)
+{
+	std::string oldval;
+	size_t vs = 0, ve = 0;
+	if (mgl_find_attr(xml, tag_start, tag_end, "path", oldval, &vs, &ve))
+	{
+		xml.replace(vs, ve - vs, newval);
+		tag_end += (ssize_t)newval.size() - (ssize_t)(ve - vs);
+		return;
+	}
+	size_t ip = tag_end;
+	if (ip > 0 && xml[ip - 1] == '/') ip--;
+	while (ip > 0 && isspace((unsigned char)xml[ip - 1])) ip--;
+	std::string ins = " path=\"";
+	ins += newval;
+	ins += "\"";
+	xml.insert(ip, ins);
+	tag_end += ins.size();
+}
+
+int minimig_mgl_save()
+{
+	mgl_struct *m = mgl_get();
+	if (!m || !m->xml_path[0]) return 0;
+
+	const char *path = m->xml_path;
+	FILE *f = fopen(path, "rb");
+	if (!f) { printf("MGL save: cannot read %s\n", path); return 0; }
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (sz <= 0 || sz > (1 << 20)) { fclose(f); return 0; }
+	std::string xml((size_t)sz, '\0');
+	if (fread(&xml[0], 1, sz, f) != (size_t)sz) { fclose(f); return 0; }
+	fclose(f);
+
+	bool dirty = false;
+
+	for (int slot = 0; slot < 4; slot++)
+	{
+		bool mounted = (df[slot].status & DSK_INSERTED) != 0;
+		const char *cur_c = df[slot].name;
+		std::string target = mounted ? (cur_c ? cur_c : "") : "";
+
+		size_t found_start = std::string::npos;
+		size_t found_end   = std::string::npos;
+		std::string existing_path;
+		size_t scan = 0;
+		while (true)
+		{
+			size_t tag = xml.find("<file", scan);
+			if (tag == std::string::npos) break;
+			size_t te = xml.find('>', tag);
+			if (te == std::string::npos) break;
+
+			std::string vtype, vindex, vpath;
+			bool ht = mgl_find_attr(xml, tag, te, "type",  vtype);
+			bool hi = mgl_find_attr(xml, tag, te, "index", vindex);
+			mgl_find_attr(xml, tag, te, "path", vpath);
+
+			if (ht && hi && (vtype == "f" || vtype == "F") && atoi(vindex.c_str()) == slot)
+			{
+				found_start = tag;
+				found_end   = te;
+				existing_path = vpath;
+				break;
+			}
+			scan = te + 1;
+		}
+
+		if (found_start != std::string::npos)
+		{
+			if (existing_path != target)
+			{
+				mgl_replace_path(xml, found_start, found_end, target);
+				dirty = true;
+			}
+		}
+		else if (mounted)
+		{
+			size_t close = xml.find("</mistergamedescription>");
+			if (close == std::string::npos) continue;
+			size_t ln = xml.rfind('\n', close);
+			std::string indent = "    ";
+			if (ln != std::string::npos)
+			{
+				size_t a = ln + 1, b = a;
+				while (b < close && (xml[b] == ' ' || xml[b] == '\t')) b++;
+				if (b > a) indent.assign(xml, a, b - a);
+			}
+			char buf[1200];
+			int delay = (slot == 0) ? 2 : 0;
+			snprintf(buf, sizeof(buf),
+				"%s<file delay=\"%d\" type=\"f\" index=\"%d\" path=\"%s\"/>\n",
+				indent.c_str(), delay, slot, cur_c ? cur_c : "");
+			xml.insert(close, buf);
+			dirty = true;
+		}
+	}
+
+	if (!dirty)
+	{
+		printf("MGL save: no floppy deltas (path=%s)\n", path);
+		return 0;
+	}
+
+	char tmp[1100];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *out = fopen(tmp, "wb");
+	if (!out) { printf("MGL save: cannot create %s\n", tmp); return 0; }
+	size_t wrote = fwrite(xml.data(), 1, xml.size(), out);
+	fclose(out);
+	if (wrote != xml.size() || rename(tmp, path) != 0)
+	{
+		printf("MGL save: write/rename failed for %s\n", path);
+		unlink(tmp);
+		return 0;
+	}
+	printf("MGL save: updated %s (%zu bytes)\n", path, xml.size());
+	return 1;
+}
+
 const char* minimig_get_cfg_info(int num, int label)
 {
 	char *filename = GetConfigurationName(num, 1);
@@ -378,7 +627,13 @@ static void ApplyConfiguration(char reloadkickstart)
 		printf("Reloading kickstart ...\n");
 		rstval |= (SPI_RST_CPU | SPI_CPU_HLT);
 		spi_uio_cmd8(UIO_MM2_RST, rstval);
-		if (!UploadKickstart(minimig_config.kickstart))
+		const char *extrom = minimig_get_extrom();
+		bool uploaded = false;
+		if (extrom[0])
+		{
+			uploaded = UploadKickstartWithExtRom(minimig_config.kickstart, extrom);
+		}
+		if (!uploaded && !UploadKickstart(minimig_config.kickstart))
 		{
 			snprintf(minimig_config.kickstart, sizeof(minimig_config.kickstart) - 1, "%s/%s", HomeDir(), "KICK.ROM");
 			if (!UploadKickstart(minimig_config.kickstart))
@@ -534,6 +789,8 @@ void minimig_reset()
 	user_io_rtc_reset();
 	minimig_share_reset();
 	a2065_start();
+	akiko_cd32_init();
+	cdtv_cd_init();
 }
 
 void minimig_set_kickstart(char *name)
@@ -541,7 +798,24 @@ void minimig_set_kickstart(char *name)
 	uint len = strlen(name);
 	if (len > (sizeof(minimig_config.kickstart) - 1)) len = sizeof(minimig_config.kickstart) - 1;
 	memcpy(minimig_config.kickstart, name, len);
-	minimig_config.kickstart[len] = 0;
+	// Zero the tail. This also clears any previously-set ext-ROM string
+	// (stored past the first null) — pairing a stale ext-ROM with a new
+	// main ROM is almost never what the user wants, and they can re-pick.
+	memset(minimig_config.kickstart + len, 0, sizeof(minimig_config.kickstart) - len);
+	force_reload_kickstart = 1;
+}
+
+void minimig_set_extrom(char *name)
+{
+	const size_t cap = sizeof(minimig_config.kickstart);
+	size_t kicklen = strnlen(minimig_config.kickstart, cap);
+	if (kicklen + 1 >= cap) return;
+	size_t off = kicklen + 1;
+	size_t room = cap - off - 1;
+	size_t nlen = strlen(name);
+	if (nlen > room) nlen = room;
+	memcpy(minimig_config.kickstart + off, name, nlen);
+	memset(minimig_config.kickstart + off + nlen, 0, cap - off - nlen);
 	force_reload_kickstart = 1;
 }
 
@@ -718,12 +992,12 @@ void minimig_ConfigMemory(unsigned char memory)
 
 void minimig_ConfigCPU(unsigned char cpu)
 {
-	spi_uio_cmd8(UIO_MM2_CPU, cpu & 0x1f);
+	spi_uio_cmd8(UIO_MM2_CPU, cpu & 0x3f);
 }
 
 void minimig_ConfigChipset(unsigned char chipset)
 {
-	spi_uio_cmd8(UIO_MM2_CHIP, chipset & 0x1f);
+	spi_uio_cmd8(UIO_MM2_CHIP, chipset & 0x3f);
 }
 
 void minimig_ConfigFloppy(unsigned char drives, unsigned char speed)
