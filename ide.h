@@ -140,6 +140,15 @@ extern ide_config ide_inst[2];
 extern const uint32_t ide_io_max_size;
 extern uint8_t ide_buf[];
 
+// Standalone CD32/CDTV drive instances, outside ide_inst[] so mounting them
+// can never interact with the real Gayle IDE register traffic (ide_io(),
+// ide_reset(), etc.) that ide_inst[]'s 2 real controllers drive. Akiko/CDTV
+// have their own dedicated SPI/UIO command paths and never touch Gayle.
+extern drive_t cd32_drive;
+extern drive_t cdtv_drive;
+// slot: 0 = CD32 (cd32_drive), 1 = CDTV (cdtv_drive).
+int cd_drive_open(int slot, const char *filename);
+
 void ide_print_regs(regs_t *regs);
 void ide_get_regs(ide_config *ide);
 void ide_set_regs(ide_config *ide);
