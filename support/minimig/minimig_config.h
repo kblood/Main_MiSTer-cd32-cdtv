@@ -9,6 +9,7 @@
 #define CONFIG_A1000     4
 #define CONFIG_ECS       8
 #define CONFIG_AGA       16
+#define CONFIG_CDTV      32
 
 #define CONFIG_FLOPPY1X  0
 #define CONFIG_FLOPPY2X  1
@@ -57,6 +58,12 @@ typedef struct
 	unsigned char   cpu;
 	unsigned char   autofire;
 	char            info[64];
+	// Dedicated CD32/CDTV drive slots (5th/6th "drive"), independent of the
+	// 4 real Gayle IDE slots above. Appended here rather than growing
+	// hardfile[] in place, so old .cfg files (size == 5216, back-compat
+	// loaded in minimig_cfg_load) still load with these zero-defaulted.
+	mm_hardfileTYPE cd32_drive;
+	mm_hardfileTYPE cdtv_drive;
 } mm_configTYPE;
 
 extern mm_configTYPE minimig_config;
@@ -67,6 +74,8 @@ const char* minimig_get_cfg_info(int num, int label);
 
 void minimig_reset();
 void minimig_set_kickstart(char *name);
+void minimig_set_extrom(char *name);
+const char* minimig_get_extrom();
 
 void minimig_set_adjust(char n);
 char minimig_get_adjust();

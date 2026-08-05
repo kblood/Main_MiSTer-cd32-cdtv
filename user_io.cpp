@@ -34,6 +34,8 @@
 #include "shmem.h"
 #include "ide.h"
 #include "ide_cdrom.h"
+#include "support/minimig/akiko_cd32.h"
+#include "support/minimig/cdtv_cd.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -270,7 +272,8 @@ char is_neogeo_cd() {
 static int is_minimig_type = 0;
 char is_minimig()
 {
-	if (!is_minimig_type) is_minimig_type = strcasecmp(orig_name, "minimig") ? 2 : 1;
+	if (!is_minimig_type) is_minimig_type =
+		(!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd")) ? 1 : 2;
 	return (is_minimig_type == 1);
 }
 
@@ -3162,6 +3165,8 @@ void user_io_poll()
 		ide_io(1, (sd_req >> 3) & 7);
 		if (sd_req & 0x0100) ide_cdda_send_sector();
 		UpdateDriveStatus();
+		akiko_cd32_poll();
+		cdtv_cd_poll();
 
 		kbd_fifo_poll();
 
@@ -3186,7 +3191,7 @@ void user_io_poll()
 	{
 		x86_poll(0);
 	}
-	else if ((core_type == CORE_TYPE_8BIT) && !is_menu() && !is_minimig())
+	else if ((core_type == CORE_TYPE_8BIT) && !is_menu())
 	{
 		if (is_st()) tos_poll();
 		if (is_snes() || is_sgb()) snes_poll();
