@@ -320,6 +320,43 @@ static uint32_t cdtv_lba2msf(uint32_t lba)
 	return (m << 16) | (s << 8) | f;
 }
 
+static int cmd_position(uint8_t *out)
+{
+	memset(out, 0, 13);
+	out[0] = cd_audio_status;
+	out[1] = 0x10;
+
+	if (cdtv_play_lba_next < 0) return 13;
+
+	uint32_t disk_lba = (uint32_t)cdtv_play_lba_next;
+
+	drive_t *drv = cdtv_play_drv ? cdtv_play_drv : cdtv_find_drive();
+	int track_idx = 0;
+	if (drv && drv->track_cnt > 1) {
+		int real_tracks = drv->track_cnt - 1;
+		for (int i = 0; i < real_tracks; i++) {
+			uint32_t s_lba = drv->track[i].start;
+			uint32_t e_lba = s_lba + drv->track[i].length;
+			track_idx = i;
+			if (disk_lba >= s_lba && disk_lba < e_lba) break;
+		}
+	}
+
+	out[2] = (uint8_t)(track_idx + 1);
+	out[3] = 0x01;
+
+	uint32_t msf = cdtv_lba2msf(disk_lba + 150);
+
+	out[5]  = (msf >> 16) & 0xff;
+	out[6]  = (msf >>  8) & 0xff;
+	out[7]  = (msf      ) & 0xff;
+	out[9]  = (msf >> 16) & 0xff;
+	out[10] = (msf >>  8) & 0xff;
+	out[11] = (msf      ) & 0xff;
+
+	return 13;
+}
+
 static int cmd_subq(const uint8_t *cmd, uint8_t *out)
 {
 	bool msf = (cmd[1] & 0x02) != 0;
@@ -769,12 +806,16 @@ static void cdtv_dispatch(void)
 		}
 
 		case 0x8b:
-			cd_paused = (cmd_buf[1] == 0x00) ? 1 : 0;
-			if (cdtv_play_lba_next >= 0)
-				cd_audio_status = cd_paused ? 0x12 : 0x11;
-			cdtv_dbg("PAUSE/RESUME cmd1=%02x → paused=%d", cmd_buf[1], cd_paused);
+			if (!(cmd_buf[1] & 0x80)) {
+				cd_paused = (cmd_buf[1] == 0x00) ? 1 : 0;
+				if (cdtv_play_lba_next >= 0)
+					cd_audio_status = cd_paused ? 0x12 : 0x11;
+				cdtv_dbg("PAUSE/RESUME cmd1=%02x -> paused=%d", cmd_buf[1], cd_paused);
+			}
+			rlen = cmd_position(reply);
+			cdtv_dbg("POSITION cmd1=%02x -> %02x:%02x.%02x playing=%d",
+			         cmd_buf[1], reply[9], reply[10], reply[11], cdtv_play_lba_next >= 0);
 			cd_finished = 1;
-			rlen = 0;
 			break;
 
 		case 0xa2:
