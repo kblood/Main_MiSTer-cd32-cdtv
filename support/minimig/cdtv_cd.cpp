@@ -21,6 +21,7 @@
 #include "../chd/mister_chd.h"
 #include "cdtv_cd.h"
 #include "minimig_config.h"
+#include "cpu_trace.h"
 
 static void cdtv_diag(const char *fmt, ...)
 {
@@ -287,7 +288,9 @@ static bool cdtv_cdda_pump(void)
 	}
 
 	if (cdtv_play_lba_next >= cdtv_play_lba_end) {
-		cdtv_dbg("CDDA natural end at lba=%u", lba);
+		static int playend_seq = 0;
+		if (++playend_seq == 2) cpu_trace_arm(60000);
+		cdtv_dbg("CDDA natural end at lba=%u seq=%d", lba, playend_seq);
 		cdtv_play_lba_next = -1;
 		cdtv_play_lba_end  = -1;
 		cdtv_play_drv      = NULL;
@@ -1176,6 +1179,8 @@ void cdtv_cd_init(void)
 
 void cdtv_cd_poll(void)
 {
+	cpu_trace_drain();
+
 	if (!cdtv_active()) return;
 
 	if (cd_save_load_pending) {
