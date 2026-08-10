@@ -27,6 +27,15 @@ void cpu_trace_arm(unsigned)
 
 void cpu_trace_drain(void)
 {
+    if (!g_csv) {
+        g_csv = fopen(OUT_PATH, "w");
+        if (!g_csv) return;
+        fprintf(g_csv,
+                "seq,batch,ts,ev,pc,stop,sv,cpustate,ipl_raw,ipl_lvl,is_l2,int2,skipfetch,stoplen_hi\n");
+    }
+
+    g_batches++;
+
     EnableIO();
     spi8(UIO_DMA_READ);
     spi32_w(CPU_TRACE_ADDR);
@@ -48,15 +57,6 @@ void cpu_trace_drain(void)
             break;
         }
 
-        if (!g_csv) {
-            g_csv = fopen(OUT_PATH, "w");
-            if (!g_csv) break;
-            fprintf(g_csv,
-                    "seq,ts,ev,pc,stop,sv,cpustate,ipl_raw,ipl_lvl,is_l2,int2,skipfetch,stoplen_hi\n");
-            g_seq = 0;
-            g_batches++;
-        }
-
         uint32_t ts = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
                       ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
         uint32_t pc = (uint32_t)b[4] | ((uint32_t)b[5] << 8) |
@@ -74,20 +74,14 @@ void cpu_trace_drain(void)
         uint16_t slen    = (uint16_t)b[10] | ((uint16_t)b[11] << 8);
 
         fprintf(g_csv,
-                "%u,%u,%s,0x%08X,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
-                g_seq++, ts, kEv[ev], pc, stop, sv, cpustate,
+                "%u,%u,%u,%s,0x%08X,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                g_seq++, g_batches, ts, kEv[ev], pc, stop, sv, cpustate,
                 ipl_raw, ipl_lvl, is_l2, int2, skipf, slen);
         got++;
     }
 
     DisableIO();
 
-    if (!got && g_csv) {
-        fprintf(g_csv, "# batch=%u resync_breaks=%u\n", g_batches, g_skipped);
-        fclose(g_csv);
-        g_csv = nullptr;
-    }
-    else if (g_csv) {
-        fflush(g_csv);
-    }
+    fprintf(g_csv, "# batch=%u rows=%d resync_breaks=%u\n", g_batches, got, g_skipped);
+    fflush(g_csv);
 }
