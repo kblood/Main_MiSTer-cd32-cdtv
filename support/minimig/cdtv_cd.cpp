@@ -560,6 +560,17 @@ static int cmd_play(const uint8_t *cmd, uint8_t *out)
 	}
 
 	if (start_is_audio && e_lba > s_lba) {
+		unsigned clamp = 0;
+		FILE *cf = fopen("/tmp/cdtv_clamp_play", "r");
+		if (cf) {
+			if (fscanf(cf, "%u", &clamp) != 1) clamp = 0;
+			fclose(cf);
+		}
+		if (clamp && e_lba - s_lba > clamp) {
+			cdtv_dbg("PLAY clamp %u -> %u sectors", e_lba - s_lba, clamp);
+			e_lba = s_lba + clamp;
+		}
+
 		cdtv_play_drv      = drv;
 		cdtv_play_lba_next = (int32_t)s_lba;
 		cdtv_play_lba_end  = (int32_t)e_lba;
