@@ -868,18 +868,26 @@ unsigned int minimig_get_extcfg()
 	return (minimig_config.ext_cfg2 << 16) | minimig_config.ext_cfg;
 }
 
+static void minimig_set_preset_roms(const char *kick, const char *ext)
+{
+	const size_t cap = sizeof(minimig_config.kickstart);
+	memset(minimig_config.kickstart, 0, cap);
+
+	int len = snprintf(minimig_config.kickstart, cap, "%s/%s", HomeDir(), kick);
+	if (len < 0 || (size_t)(len + 1) >= cap) return;
+
+	snprintf(minimig_config.kickstart + len + 1, cap - len - 1, "%s/%s", HomeDir(), ext);
+}
+
 void minimig_cfg_set(int preset)
 {
-	int len;
 	switch (preset)
 	{
 	case CONFIG_PRESET_CD32:
 		minimig_config.cpu = 3; // 68020, d-cache off;
 		minimig_config.chipset = (6 << 2); // AGA
 		minimig_config.memory = 3; // ChipRAM 2MB, FastRAM 0MB
-		strcpy(minimig_config.kickstart, "Games/Amiga/CD32.rom");
-		len = strlen(minimig_config.kickstart);
-		strcpy(minimig_config.kickstart+len+1, "Games/Amiga/CD32_ext.rom");
+		minimig_set_preset_roms("CD32.rom", "CD32_ext.rom");
 		minimig_config.autofire = 2 << 1; // CD32 joystick
 		minimig_config.cd32_drive.cfg = 1;
 		minimig_config.cdtv_drive.cfg = 0;
@@ -890,9 +898,7 @@ void minimig_cfg_set(int preset)
 		minimig_config.cpu = 0; // 68000
 		minimig_config.chipset = (2 << 2); // ECS
 		minimig_config.memory = 1; // ChipRAM 1MB, FastRAM 0MB
-		strcpy(minimig_config.kickstart, "Games/Amiga/CDTV.rom");
-		len = strlen(minimig_config.kickstart);
-		strcpy(minimig_config.kickstart + len + 1, "Games/Amiga/CDTV_ext.rom");
+		minimig_set_preset_roms("CDTV.rom", "CDTV_ext.rom");
 		minimig_config.autofire = 0; // Digital joystick
 		minimig_config.cd32_drive.cfg = 0;
 		minimig_config.cdtv_drive.cfg = 1;
