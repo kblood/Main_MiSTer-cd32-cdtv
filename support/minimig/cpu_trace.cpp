@@ -22,6 +22,7 @@ static uint32_t g_seq = 0;
 static bool g_gate_prev = false;
 static bool g_armed = false;
 static unsigned g_rows_left = 0;
+static uint32_t g_skipped = 0;
 
 void cpu_trace_arm(unsigned max_rows)
 {
@@ -41,6 +42,7 @@ void cpu_trace_drain(void)
     }
     g_gate_prev = on;
     if (g_armed && !g_rows_left && g_csv) {
+        fprintf(g_csv, "# resync_breaks=%u\n", g_skipped);
         fclose(g_csv);
         g_csv = nullptr;
     }
@@ -56,6 +58,14 @@ void cpu_trace_drain(void)
         uint32_t all_or = 0;
         for (int j = 0; j < 16; j++) all_or |= b[j];
         if (!all_or) break;
+
+        uint8_t ev_nib = (b[8] >> 4) & 0xF;
+        bool sane = (ev_nib == 1 || ev_nib == 2 || ev_nib == 4 || ev_nib == 5) &&
+                    !b[12] && !b[13] && !b[14] && !b[15];
+        if (!sane) {
+            g_skipped++;
+            break;
+        }
 
         if (!on) continue;
 
@@ -89,6 +99,7 @@ void cpu_trace_drain(void)
                 "%u,%u,%s,0x%08X,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
                 g_seq++, ts, kEv[ev], pc, stop, sv, cpustate,
                 ipl_raw, ipl_lvl, is_l2, int2, skipf, win);
+        if (g_armed && g_rows_left) g_rows_left--;
     }
 
     DisableIO();
