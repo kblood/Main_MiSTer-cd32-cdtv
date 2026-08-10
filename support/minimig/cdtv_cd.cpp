@@ -289,7 +289,7 @@ static bool cdtv_cdda_pump(void)
 
 	if (cdtv_play_lba_next >= cdtv_play_lba_end) {
 		static int playend_seq = 0;
-		if (++playend_seq == 2) cpu_trace_arm(60000);
+		if (++playend_seq == 2) cpu_trace_arm(300);
 		cdtv_dbg("CDDA natural end at lba=%u seq=%d", lba, playend_seq);
 		cdtv_play_lba_next = -1;
 		cdtv_play_lba_end  = -1;

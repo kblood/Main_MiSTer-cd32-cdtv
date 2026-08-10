@@ -6,6 +6,7 @@
 
 #include "../../spi.h"
 #include "../../user_io.h"
+#include "../../hardware.h"
 
 static constexpr uint32_t CPU_TRACE_ADDR = 0xFE00;
 static constexpr int      RING_DEPTH     = 512;
@@ -16,17 +17,28 @@ static const char *kEv[16] = {
     "rsv", "rsv", "rsv", "rsv", "rsv", "rsv", "rsv", "rsv", "rsv", "rsv"
 };
 
+static constexpr unsigned SAMPLE_PERIOD_MS = 500;
+
 static FILE *g_csv = nullptr;
 static uint32_t g_seq = 0;
 static uint32_t g_skipped = 0;
 static uint32_t g_batches = 0;
+static unsigned g_budget = 0;
+static unsigned long g_next_ms = 0;
 
-void cpu_trace_arm(unsigned)
+void cpu_trace_arm(unsigned max_batches)
 {
+    if (g_budget) return;
+    g_budget  = max_batches ? max_batches : 1;
+    g_next_ms = GetTimer(0);
 }
 
 void cpu_trace_drain(void)
 {
+    if (!g_budget) return;
+    if (!CheckTimer(g_next_ms)) return;
+    g_next_ms = GetTimer(SAMPLE_PERIOD_MS);
+
     if (!g_csv) {
         g_csv = fopen(OUT_PATH, "w");
         if (!g_csv) return;
