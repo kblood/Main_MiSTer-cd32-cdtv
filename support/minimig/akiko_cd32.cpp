@@ -894,8 +894,26 @@ static bool akiko_nvram_save_to_disk(void)
 	return akiko_nvram_save_to_path(target);
 }
 
+#define AKIKO_SECTOR_PERIOD_US 6666
+
 static void akiko_push_sector(const uint8_t *buf)
 {
+	static struct timespec prev;
+	static bool have_prev = false;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (have_prev) {
+		int64_t us = (int64_t)(now.tv_sec - prev.tv_sec) * 1000000
+		           + (now.tv_nsec - prev.tv_nsec) / 1000;
+		if (us >= 0 && us < AKIKO_SECTOR_PERIOD_US) {
+			usleep((useconds_t)(AKIKO_SECTOR_PERIOD_US - us));
+			clock_gettime(CLOCK_MONOTONIC, &now);
+		}
+	}
+	prev = now;
+	have_prev = true;
+
 	akiko_ext_block_write(AKIKO_SECTOR_ADDR, buf, AKIKO_SECTOR_BYTES);
 }
 
