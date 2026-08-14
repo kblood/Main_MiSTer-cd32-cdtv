@@ -291,6 +291,11 @@ static void akiko_dbg_dump(const char *tag)
 	const uint32_t rxaddr = ((uint32_t)(w[6] >> 8) << 16) | w[5];
 	const unsigned roff   = w[6] & 0x3f;
 	const unsigned rxcan  = (w[7] >> 13) & 1;
+	// Drains that left bytes in the command buffer. hps_cmd_done clears the
+	// whole buffer, so each of these discarded at least one byte and desynced
+	// the guest's next command. Saturates at 31.
+	const unsigned drops  = (w[7] >> 6) & 0x1f;
+	const unsigned clen   = w[7] & 0x3f;
 
 	const unsigned irq  = ((intreq & intena) & 0xfe) ? 1 : 0;
 	// How many bytes the guest's window will accept before RXDMADONE fires.
@@ -300,14 +305,14 @@ static void akiko_dbg_dump(const char *tag)
 	           "intreq=%02x[XMIT=%u RECV=%u RXDMA=%u] irq=%u "
 	           "flags=%02x[RXD=%u EN=%u] rxinx=%02x rxcmp=%02x gap=%u "
 	           "txinx=%02x txcmp=%02x rlen=%u roff=%u rxbusy=%u rxcan=%u "
-	           "rxaddr=%06x",
+	           "rxaddr=%06x clen=%u drops=%u",
 	           tag,
 	           intena, (intena >> 6) & 1, (intena >> 5) & 1, (intena >> 4) & 1,
 	           intreq, (intreq >> 6) & 1, (intreq >> 5) & 1, (intreq >> 4) & 1,
 	           irq,
 	           flags, (flags >> 5) & 1, (flags >> 2) & 1,
 	           rxinx, rxcmp, gap, txinx, txcmp, rlen, roff, rxbusy, rxcan,
-	           rxaddr);
+	           rxaddr, clen, drops);
 }
 
 static uint8_t akiko_read_sec_counter(void);
