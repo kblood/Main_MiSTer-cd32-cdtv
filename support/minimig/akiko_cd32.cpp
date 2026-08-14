@@ -1444,12 +1444,55 @@ static void akiko_diag(const char *fmt, ...)
 	fflush(stdout);
 }
 
+// Samples the CPU tap so a guest that stops talking to Akiko can still be
+// told apart from one that has stopped executing. Words 9..12 of the 0x64
+// snapshot, which the host reads as w[8..11] because w[0] is the magic.
+static void akiko_cpu_sample(void)
+{
+	static uint32_t next_ms   = 0;
+	static uint32_t prev_cnt  = 0;
+	static bool     have_prev = false;
+
+	if (!CheckTimer(next_ms)) return;
+	next_ms = (uint32_t)GetTimer(250);
+
+	uint16_t w[12];
+	EnableIO();
+	spi_w(AKIKO_DBG_CMD);
+	for (int i = 0; i < 12; i++) w[i] = spi_w(0);
+	DisableIO();
+
+	if (w[0] != AKIKO_DBG_MAGIC) return;
+
+	const uint32_t addr  = ((uint32_t)(w[9] & 0x00ff) << 16) | w[8];
+	const uint8_t  fl    = (uint8_t)(w[9] >> 8);
+	const uint32_t cnt   = ((uint32_t)w[11] << 16) | w[10];
+
+	const unsigned cacr  = (fl >> 4) & 0xf;
+	const unsigned nrst  = (fl >> 3) & 1;
+	const unsigned crst  = (fl >> 2) & 1;
+	const unsigned state = fl & 3;
+
+	// Accesses since the last sample. Zero means the CPU is not running a
+	// bus cycle at all - halted, or stalled waiting for a DTACK that is
+	// never coming. `state` and `addr` say which.
+	const uint32_t delta = have_prev ? (cnt - prev_cnt) : 0;
+	prev_cnt  = cnt;
+	have_prev = true;
+
+	akiko_diag("[akiko] cpu addr=%06x acc=%u d=%u cacr=%x nrst_out=%u cpu_rst=%u state=%u%s",
+	           addr, cnt, delta, cacr, nrst, crst, state,
+	           delta ? "" : "  <-- NO BUS ACTIVITY");
+}
+
 void akiko_cd32_poll(void)
 {
 	if (akiko_dbg_after_armed && CheckTimer(akiko_dbg_after_ms)) {
 		akiko_dbg_after_armed = false;
 		akiko_dbg_dump("+2s");
 	}
+
+	if (cd32_active()) akiko_cpu_sample();
 
 	const bool mounted = cd32_active() && cd_is_mounted();
 	const cd_media_level_t level = mounted ? CD_MEDIA_PRESENT : CD_MEDIA_ABSENT;
