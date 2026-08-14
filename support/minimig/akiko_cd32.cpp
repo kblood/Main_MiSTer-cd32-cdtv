@@ -807,8 +807,26 @@ static void akiko_reject_diag(const char *why, const uint8_t *cmd, int n,
 	for (int i = 0; i < n && i < AKIKO_CMD_MAX; i++)
 		off += snprintf(hex + off, sizeof(hex) - off, "%02x ", cmd[i]);
 	if (off > 0) hex[off - 1] = '\0';
-	akiko_diag("[akiko] REJECT %s n=%d expected=%d sum=%02x bytes=%s",
-	           why, n, expected, sum, hex);
+
+	// The TX ring index, read here and not from a periodic dump. The drained
+	// bytes are zeros rather than a stream shifted by one, so they came out of
+	// chip RAM the guest never wrote, and the only thing that walks the guest's
+	// 256-byte ring is cdcomtxinx. Its loop guard is a bare inequality against
+	// cdcomtxcmp, so an index that ever passes the mark must walk all 256 bytes
+	// to come back - which is the shape of these bursts. The periodic dumps are
+	// 2 s apart and a burst lasts 8 ms, so they have never once sampled it.
+	uint16_t w[4];
+	EnableIO();
+	spi_w(AKIKO_DBG_CMD);
+	for (int i = 0; i < 4; i++) w[i] = spi_w(0);
+	DisableIO();
+	if (w[0] == AKIKO_DBG_MAGIC)
+		akiko_diag("[akiko] REJECT %s n=%d expected=%d sum=%02x txinx=%02x "
+		           "txcmp=%02x bytes=%s", why, n, expected, sum,
+		           (uint8_t)(w[3] >> 8), (uint8_t)(w[3] & 0xff), hex);
+	else
+		akiko_diag("[akiko] REJECT %s n=%d expected=%d sum=%02x bytes=%s",
+		           why, n, expected, sum, hex);
 }
 
 static void cmd_bad(const uint8_t *cmd, uint8_t err_code)
