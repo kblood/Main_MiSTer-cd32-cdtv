@@ -29,6 +29,7 @@
 #include "video.h"
 #include "audio.h"
 #include "joymapping.h"
+#include "support/minimig/minimig_config.h"
 #include "support.h"
 #include "profiling.h"
 #include "gamecontroller_db.h"
@@ -6257,6 +6258,26 @@ int input_test(int getchar)
 								p++;
 						}
 						request_screenshot(p, scaled);
+					}
+					// AKIKO_TEST_HOOKS: temporary test instrument, never shipped.
+					// The OSD is the only user-facing route to a runtime disc
+					// change, but it cannot be driven reliably - MiSTer's
+					// screenshot path cannot capture it, so key injection is
+					// open-loop and a mis-stepped row gets scored as a result.
+					// These call exactly the function the OSD's
+					// MENU_MINIMIG_CD32FILE_SELECTED handler calls, so they
+					// exercise the bridge under test rather than the menu.
+					else if (!strncmp(cmd, "cd_mount ", 9))
+					{
+						printf("[test] cd_mount %s -> %d\n", cmd + 9,
+							minimig_cd_drive_open(0, cmd + 9));
+						fflush(stdout);
+					}
+					else if (!strcmp(cmd, "cd_eject"))
+					{
+						printf("[test] cd_eject -> %d\n",
+							minimig_cd_drive_open(0, ""));
+						fflush(stdout);
 					}
 					else if (!strncmp(cmd, "volume ", 7))
 					{
