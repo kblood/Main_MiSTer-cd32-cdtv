@@ -246,6 +246,22 @@ static uint16_t akiko_read_status(void)
 static uint32_t akiko_dbg_after_ms    = 0;
 static bool     akiko_dbg_after_armed = false;
 
+// cdcomrxcmp - cdcomrxinx, the distance to the guest's completion mark, or -1
+// if this core has no diag vector. 1 means the next frame's last byte lands
+// exactly on the mark and RXDMADONE fires.
+static int akiko_dbg_gap(void)
+{
+	uint16_t w[3];
+	EnableIO();
+	spi_w(AKIKO_DBG_CMD);
+	for (int i = 0; i < 3; i++) w[i] = spi_w(0);
+	DisableIO();
+	if (w[0] != AKIKO_DBG_MAGIC) return -1;
+	const uint8_t rxinx = (uint8_t)(w[2] >> 8);
+	const uint8_t rxcmp = (uint8_t)(w[2] & 0xff);
+	return (uint8_t)(rxcmp - rxinx);
+}
+
 static void akiko_dbg_dump(const char *tag)
 {
 	uint16_t w[8];
@@ -462,9 +478,17 @@ static bool akiko_push_toc_entry(void)
 	r[6] = bin_to_bcd(99);
 	r[7] = bin_to_bcd((uint8_t)(24u + (uint32_t)counter / 75u));
 	r[8] = bin_to_bcd((uint8_t)((uint32_t)counter % 75u));
+	// What the guest's receive window looked like when this frame went out.
+	// rx_idle only says the previous DMA finished; RXDMADONE additionally
+	// needs cdcomrxinx + 1 == cdcomrxcmp once the frame lands, so a frame
+	// pushed at any other gap drains with no completion interrupt and the
+	// guest's pending request never finishes. Recorded, not acted on, until
+	// the correlation with a stalled trial is measured.
+	const int gap = akiko_dbg_gap();
 	akiko_send_response(r, 15);
-	akiko_diag("[akiko] TOC push idx=%d point_idx=%d point=0x%02x ctrl=0x%02x msf=%02x:%02x:%02x",
-	           toc_push_idx, point_idx, r[5], (r[3] >> 4) & 0x0f, r[10], r[11], r[12]);
+	akiko_diag("[akiko] TOC push idx=%d point_idx=%d point=0x%02x ctrl=0x%02x msf=%02x:%02x:%02x gap=%d%s",
+	           toc_push_idx, point_idx, r[5], (r[3] >> 4) & 0x0f, r[10], r[11], r[12],
+	           gap, gap == 1 ? "" : "  <-- WINDOW NOT ARMED FOR THIS FRAME");
 	toc_push_idx++;
 	return true;
 }
