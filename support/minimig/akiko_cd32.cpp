@@ -1444,6 +1444,8 @@ static void akiko_diag(const char *fmt, ...)
 	fflush(stdout);
 }
 
+#define AKIKO_CPU_TAP_NOW "/tmp/akiko_cpu_tap_now"
+
 // Samples the CPU tap so a guest that stops talking to Akiko can still be
 // told apart from one that has stopped executing. Words 9..12 of the 0x64
 // snapshot, which the host reads as w[8..11] because w[0] is the magic.
@@ -1453,20 +1455,39 @@ static void akiko_cpu_sample(void)
 	static uint32_t prev_cnt  = 0;
 	static bool     have_prev = false;
 
-	// Polling the UIO four times a second is itself SPI traffic, and the
-	// fault under investigation is a race. Touch the flag file to take the
-	// sampling out while keeping the same binary and the same bitstream -
-	// otherwise the control arm needs a rebuild, and a fresh place-and-route
-	// can move a marginal race on its own. Not under /tmp: the rate harness
-	// reboots before every trial, which would silently re-enable sampling
-	// from trial two onwards and quietly turn the control back into the
-	// experiment.
-	static int enabled = -1;
-	if (enabled < 0) enabled = (access("/media/fat/akiko_cpu_tap_off", F_OK) == 0) ? 0 : 1;
-	if (!enabled) return;
+	// Sampling continuously destroys the measurement. Four SPI transactions a
+	// second land in the middle of the race this is meant to observe, and the
+	// rates say so: same bitstream, 8/8 cold with the poll running against 6/7
+	// with it silent, the failure appearing only in the silent arm. So the
+	// default is to touch the bus not at all.
+	//
+	// Nothing is lost by waiting. The failing guest stops and stays stopped,
+	// so its last address and its access counter are just as true a minute
+	// later as they are during the fault. The harness decides the outcome from
+	// the screen and then asks for a burst, which is SPI traffic that arrives
+	// after everything it could have disturbed has already happened.
+	//
+	// /tmp for the request, because it must not survive the reboot the harness
+	// does before each trial; /media/fat for the continuous mode, because a
+	// /tmp flag would silently switch it off from trial two onwards.
+	static int always = -1;
+	if (always < 0) always = (access("/media/fat/akiko_cpu_tap_continuous", F_OK) == 0);
 
+	static int burst = 0;
 	if (!CheckTimer(next_ms)) return;
-	next_ms = (uint32_t)GetTimer(250);
+	next_ms = (uint32_t)GetTimer(always ? 250 : 500);
+
+	if (!always) {
+		if (!burst) {
+			if (access(AKIKO_CPU_TAP_NOW, F_OK) != 0) return;
+			// Take the request now so a slow burst cannot be re-armed by the
+			// same file, and so the harness can see it was picked up.
+			unlink(AKIKO_CPU_TAP_NOW);
+			burst     = 8;
+			have_prev = false;
+		}
+		burst--;
+	}
 
 	uint16_t w[12];
 	EnableIO();
