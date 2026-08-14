@@ -31,6 +31,12 @@ static void akiko_diag(const char *fmt, ...);
 	#define akiko_dbg(...) do { } while (0)
 #endif
 
+// Frame-level trace of both directions, to be diffed against a WinUAE
+// -cd32log2 capture of the same workload. Capped, because an uncapped akiko
+// trace has flooded the rig's log before now.
+#define AKIKO_FRAME_TRACE      1
+#define AKIKO_FRAME_TRACE_MAX  400
+
 #define AKIKO_BRIDGE_ADDR  0xF400
 
 #define AKIKO_CDDA_ADDR        0xF200
@@ -228,6 +234,66 @@ static uint16_t akiko_read_status(void)
 	return res;
 }
 
+// Guest-programmed Akiko state, readable only from a matched diagnostic core
+// (UIO 0x64). The question it exists to answer: at the instant we announce a
+// disc, is the guest's RX window open for exactly one byte? The CD32 ROM waits
+// with intena = RXDMADONE only, and RXDMADONE fires only on the exact equality
+// cdcomrxinx + 1 == cdcomrxcmp - so a window wider than the frame swallows the
+// announcement with no interrupt at all.
+#define AKIKO_DBG_CMD    0x64
+#define AKIKO_DBG_MAGIC  0xACD0
+
+static uint32_t akiko_dbg_after_ms    = 0;
+static bool     akiko_dbg_after_armed = false;
+
+static void akiko_dbg_dump(const char *tag)
+{
+	uint16_t w[8];
+	EnableIO();
+	spi_w(AKIKO_DBG_CMD);
+	for (int i = 0; i < 8; i++) w[i] = spi_w(0);
+	DisableIO();
+
+	if (w[0] != AKIKO_DBG_MAGIC) {
+		// A stock core answers nothing here. Say so rather than printing
+		// decoded zeroes that would read like a measurement.
+		akiko_diag("[akiko] dbg %-4s BADMAGIC (not a diag core?) raw=%04x %04x "
+		           "%04x %04x %04x %04x %04x %04x", tag,
+		           w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+		return;
+	}
+
+	const uint8_t  intena = (uint8_t)(w[1] >> 8);
+	const uint8_t  intreq = (uint8_t)(w[1] & 0xff);
+	const uint8_t  rxinx  = (uint8_t)(w[2] >> 8);
+	const uint8_t  rxcmp  = (uint8_t)(w[2] & 0xff);
+	const uint8_t  txinx  = (uint8_t)(w[3] >> 8);
+	const uint8_t  txcmp  = (uint8_t)(w[3] & 0xff);
+	const uint8_t  flags  = (uint8_t)(w[4] >> 8);
+	const unsigned rxbusy = (w[4] >> 7) & 1;
+	const unsigned rlen   = w[4] & 0x3f;
+	const uint32_t rxaddr = ((uint32_t)(w[6] >> 8) << 16) | w[5];
+	const unsigned roff   = w[6] & 0x3f;
+	const unsigned rxcan  = (w[7] >> 13) & 1;
+
+	const unsigned irq  = ((intreq & intena) & 0xfe) ? 1 : 0;
+	// How many bytes the guest's window will accept before RXDMADONE fires.
+	const unsigned gap  = (unsigned)((rxcmp - rxinx) & 0xff);
+
+	akiko_diag("[akiko] dbg %-4s intena=%02x[XMIT=%u RECV=%u RXDMA=%u] "
+	           "intreq=%02x[XMIT=%u RECV=%u RXDMA=%u] irq=%u "
+	           "flags=%02x[RXD=%u EN=%u] rxinx=%02x rxcmp=%02x gap=%u "
+	           "txinx=%02x txcmp=%02x rlen=%u roff=%u rxbusy=%u rxcan=%u "
+	           "rxaddr=%06x",
+	           tag,
+	           intena, (intena >> 6) & 1, (intena >> 5) & 1, (intena >> 4) & 1,
+	           intreq, (intreq >> 6) & 1, (intreq >> 5) & 1, (intreq >> 4) & 1,
+	           irq,
+	           flags, (flags >> 5) & 1, (flags >> 2) & 1,
+	           rxinx, rxcmp, gap, txinx, txcmp, rlen, roff, rxbusy, rxcan,
+	           rxaddr);
+}
+
 static uint8_t akiko_read_sec_counter(void);
 
 static bool akiko_wait_status_bit(uint16_t mask, bool want_set, int max_iters)
@@ -283,6 +349,21 @@ static void akiko_send_response(const uint8_t *payload, int len)
 	out[len] = (uint8_t)(0xff - (sum & 0xff));
 
 	int total = len + 1;
+
+#if AKIKO_FRAME_TRACE
+	{
+		static int tx_trace_count = 0;
+		if (tx_trace_count < AKIKO_FRAME_TRACE_MAX) {
+			tx_trace_count++;
+			char hex[3 * (AKIKO_CMD_MAX + 1) + 1];
+			int  off = 0;
+			for (int i = 0; i < total; i++)
+				off += snprintf(hex + off, sizeof(hex) - off, "%02x ", out[i]);
+			if (off > 0) hex[off - 1] = '\0';
+			akiko_diag("[akiko] OUT len=%d %s", total, hex);
+		}
+	}
+#endif
 
 	EnableIO();
 	spi8(UIO_DMA_WRITE);
@@ -1365,6 +1446,11 @@ static void akiko_diag(const char *fmt, ...)
 
 void akiko_cd32_poll(void)
 {
+	if (akiko_dbg_after_armed && CheckTimer(akiko_dbg_after_ms)) {
+		akiko_dbg_after_armed = false;
+		akiko_dbg_dump("+2s");
+	}
+
 	const bool mounted = cd32_active() && cd_is_mounted();
 	const cd_media_level_t level = mounted ? CD_MEDIA_PRESENT : CD_MEDIA_ABSENT;
 
@@ -1441,8 +1527,12 @@ void akiko_cd32_poll(void)
 			uint8_t r[2];
 			r[0] = 0x0a;
 			r[1] = 0x01;
+			akiko_dbg_dump("pre");
 			akiko_send_response(r, 2);
 			akiko_diag("[akiko] auto-init media-status push: opcode=0x0a status=0x01");
+			akiko_dbg_dump("post");
+			akiko_dbg_after_ms    = (uint32_t)GetTimer(2000);
+			akiko_dbg_after_armed = true;
 		}
 		cd_initialized = 1;
 		return;
@@ -1452,10 +1542,14 @@ void akiko_cd32_poll(void)
 		uint8_t r[2];
 		r[0] = 0x0a;
 		r[1] = cd_media_present() ? 0x01 : 0x00;
+		akiko_dbg_dump("pre");
 		akiko_send_response(r, 2);
 		cd_media_push_pending = false;
 		akiko_build_toc();
 		akiko_diag("[akiko] media-status push: opcode=0x0a status=0x%02x", r[1]);
+		akiko_dbg_dump("post");
+		akiko_dbg_after_ms    = (uint32_t)GetTimer(2000);
+		akiko_dbg_after_armed = true;
 		return;
 	}
 
@@ -1559,7 +1653,12 @@ void akiko_cd32_poll(void)
 		}
 	}
 
-	if (op != 0x05) {
+	// op 0x05 is LED, and it was filtered out here. The CD32 ROM's very first
+	// reaction to a disc it has noticed is an LED command, so filtering it
+	// made "the guest issued nothing" unfalsifiable for the one opcode that
+	// would have disproved it.
+	static int cmd_trace_count = 0;
+	if (op != 0x05 || (AKIKO_FRAME_TRACE && cmd_trace_count++ < AKIKO_FRAME_TRACE_MAX)) {
 		char hex[3 * AKIKO_CMD_MAX + 1];
 		int  off = 0;
 		for (int i = 0; i < n && i < 16; i++) {
