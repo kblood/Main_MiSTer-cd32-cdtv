@@ -790,6 +790,22 @@ static void cmd_subq(const uint8_t *cmd)
 	          t.number, cur_lba, tm, ts, tf, dm, ds, df);
 }
 
+// A rejected frame is otherwise invisible: the checks return before the
+// "[akiko] CMD op=..." trace, and cmd_bad's own akiko_dbg line does not reach
+// the log either, so the only evidence is decoding the 0x89 reply by hand.
+// Print what was actually drained, through akiko_diag so it lands in the log.
+static void akiko_reject_diag(const char *why, const uint8_t *cmd, int n,
+                              int expected, unsigned sum)
+{
+	char hex[3 * AKIKO_CMD_MAX + 1];
+	int  off = 0;
+	for (int i = 0; i < n && i < AKIKO_CMD_MAX; i++)
+		off += snprintf(hex + off, sizeof(hex) - off, "%02x ", cmd[i]);
+	if (off > 0) hex[off - 1] = '\0';
+	akiko_diag("[akiko] REJECT %s n=%d expected=%d sum=%02x bytes=%s",
+	           why, n, expected, sum, hex);
+}
+
 static void cmd_bad(const uint8_t *cmd, uint8_t err_code)
 {
 	uint8_t r[2];
@@ -1740,14 +1756,14 @@ void akiko_cd32_poll(void)
 	if (expected_len > 0) {
 		int chk_total = expected_len + 1;
 		if (n < chk_total) {
-			akiko_dbg("short frame: n=%d expected=%d\n", n, chk_total);
+			akiko_reject_diag("short", cmd, n, chk_total, 0);
 			cmd_bad(cmd, CH_ERR_CHECKSUM);
 			return;
 		}
 		uint32_t sum = 0;
 		for (int i = 0; i < chk_total; i++) sum += cmd[i];
 		if ((sum & 0xff) != 0xff) {
-			akiko_dbg("checksum FAIL sum=%02x\n", sum & 0xff);
+			akiko_reject_diag("cksum", cmd, n, chk_total, sum & 0xff);
 			cmd_bad(cmd, CH_ERR_CHECKSUM);
 			return;
 		}
@@ -1789,6 +1805,9 @@ void akiko_cd32_poll(void)
 			akiko_dbg("CMD 0x%02x consumed (no response per WinUAE parity)\n", op);
 			break;
 		default:
+			// Opcodes 0x0b-0x0f are not commands the guest issues, so reaching
+			// here is itself evidence the drain started mid-frame.
+			akiko_reject_diag("badop", cmd, n, 0, 0);
 			cmd_bad(cmd, CH_ERR_BADCOMMAND);
 			break;
 	}
