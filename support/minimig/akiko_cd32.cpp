@@ -1453,6 +1453,15 @@ static void akiko_cpu_sample(void)
 	static uint32_t prev_cnt  = 0;
 	static bool     have_prev = false;
 
+	// Polling the UIO four times a second is itself SPI traffic, and the
+	// fault under investigation is a race. Touch /tmp/akiko_cpu_tap_off to
+	// take the sampling out while keeping the same binary and the same
+	// bitstream - otherwise the control arm needs a rebuild, and a fresh
+	// place-and-route can move a marginal race on its own.
+	static int enabled = -1;
+	if (enabled < 0) enabled = (access("/tmp/akiko_cpu_tap_off", F_OK) == 0) ? 0 : 1;
+	if (!enabled) return;
+
 	if (!CheckTimer(next_ms)) return;
 	next_ms = (uint32_t)GetTimer(250);
 
