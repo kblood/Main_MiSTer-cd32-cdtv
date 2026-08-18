@@ -836,7 +836,7 @@ void minimig_ConfigCPU(unsigned char cpu)
 
 void minimig_ConfigChipset(mm_configTYPE *config)
 {
-	unsigned char chipset = config->cdtv_drive.cfg ? (config->chipset | CONFIG_CDTV) : (config->chipset & ~CONFIG_CDTV);
+	unsigned char chipset = config->chipset;
 	spi_uio_cmd8(UIO_MM2_CHIP, chipset & 0x3f);
 }
 

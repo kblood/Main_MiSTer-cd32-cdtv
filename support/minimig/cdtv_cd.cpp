@@ -1227,6 +1227,7 @@ void cdtv_cd_poll(void)
 		if (!(status & CDTV_STATUS_REQ)) break;
 
 		uint8_t b = cdtv_drain_byte();
+		cdtv_dbg("BYTE %02x idx=%d need=%d", b, cmd_idx, cmd_need);
 
 		if (cmd_idx == 0) {
 			cmd_need = cr511_command_length(b);
