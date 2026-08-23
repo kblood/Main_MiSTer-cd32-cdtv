@@ -283,7 +283,7 @@ char is_minimig()
 {
 	if (!is_minimig_type)
 	{
-		is_minimig_type = (!strcasecmp(orig_name, "minimig") || !strcasecmp(orig_name, "minimigcd")) ? 1 : 2;
+		is_minimig_type = (!strncasecmp(orig_name, "minimig", 7)) ? 1 : 2;
 		if (is_minimig_type == 1)
 		{
 			uint16_t res = spi_uio_cmd(UIO_GET_VMODE);
