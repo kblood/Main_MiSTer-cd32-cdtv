@@ -36,6 +36,7 @@
 #include "ide_cdrom.h"
 #include "support/minimig/akiko_cd32.h"
 #include "support/minimig/cdtv_cd.h"
+#include "support/minimig/chipset_trace.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -3158,6 +3159,11 @@ void user_io_poll()
 	// this is reduce risk of screenshot occurring while the scaler
 	// is being updated and getting a corrupted image.
 	add_frame_callback(screenshot_cb);
+
+	// Hybris cycle-diff matrix (2026-08-23): unconditional so it works
+	// under any CONF_STR (plain "Minimig", not just CD32/CDTV), self-gated
+	// internally on /tmp/chipset_trace_on.
+	chipset_trace_drain();
 
 	if ((core_type != CORE_TYPE_SHARPMZ) &&
 		(core_type != CORE_TYPE_8BIT))
