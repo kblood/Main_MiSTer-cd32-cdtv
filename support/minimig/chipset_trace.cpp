@@ -73,6 +73,12 @@ void chipset_trace_drain(void)
     if (!g_csv) {
         g_csv = fopen(OUT_PATH, "w");
         if (!g_csv) return;
+        // Self-describing header. batch*period is the capture's only
+        // wall clock, so a consumer that assumes the wrong period
+        // silently rescales every timestamp. Emit it rather than let
+        // the analysis tools hardcode a value that drifts out of sync
+        // with this constant.
+        fprintf(g_csv, "# period_ms=%u\n", SAMPLE_PERIOD_MS);
         fprintf(g_csv, "seq,vpos,hpos,src,reg,data,dbwe\n");
     }
 
