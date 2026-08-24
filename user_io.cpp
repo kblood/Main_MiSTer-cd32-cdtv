@@ -37,6 +37,7 @@
 #include "support/minimig/akiko_cd32.h"
 #include "support/minimig/cdtv_cd.h"
 #include "support/minimig/chipset_trace.h"
+#include "support/minimig/cpu_trace.h"
 #ifdef PROFILING
 #include "profiling.h"
 #endif
@@ -3164,6 +3165,12 @@ void user_io_poll()
 	// under any CONF_STR (plain "Minimig", not just CD32/CDTV), self-gated
 	// internally on /tmp/chipset_trace_on.
 	chipset_trace_drain();
+
+	// Cross-chip cycle tracer: vpos-windowed CPU-fetch ring, self-gated on
+	// /tmp/cpu_trace_on. Shares the same free-running tstamp clock as the
+	// chipset_trace_drain() ring above, so the two CSVs are correlatable.
+	cpu_trace_poll();
+	cpu_trace_drain();
 
 	if ((core_type != CORE_TYPE_SHARPMZ) &&
 		(core_type != CORE_TYPE_8BIT))

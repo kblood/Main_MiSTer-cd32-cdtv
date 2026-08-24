@@ -36,6 +36,24 @@ void cpu_trace_arm(unsigned max_batches)
     g_next_ms = GetTimer(0);
 }
 
+// Generic marker-file arm (Hybris cycle-diff-matrix goal), mirroring
+// chipset_trace.cpp's /tmp/chipset_trace_on pattern: rising edge on
+// /tmp/cpu_trace_on arms 120 batches (~60s of 500ms-spaced snapshot
+// drains of the vpos-windowed ring). Independent of cdtv_cd.cpp's own
+// hardcoded cpu_trace_arm(300) call for the DotC-CDTV investigation --
+// both share the same budget counter, so whichever arms first wins until
+// its budget runs out.
+static const char *CPU_TRACE_ARM_MARKER = "/tmp/cpu_trace_on";
+static bool g_cpu_trace_marker_was_present = false;
+
+void cpu_trace_poll(void)
+{
+    struct stat st;
+    bool present = (stat(CPU_TRACE_ARM_MARKER, &st) == 0);
+    if (present && !g_cpu_trace_marker_was_present) cpu_trace_arm(120);
+    g_cpu_trace_marker_was_present = present;
+}
+
 void cpu_trace_drain(void)
 {
     if (!g_budget) return;
