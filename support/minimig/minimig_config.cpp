@@ -28,6 +28,9 @@ const char *config_memory_slow_msg[] = { "none", "512K", "1M",   "1.5M" };
 const char *config_memory_fast_msg[][8] = { { "none", "2M", "4M", "8M", "8M",    "8M",    "8M",   "8M" } ,
 											{ "none", "2M", "4M", "8M", "256M", "384M", "256M", "256M" } };
 const char *config_cpu_msg[] = { "68000", "68010", "-----","68020" };
+const char *config_dbg_bltpri_msg[] = { "Guest", "Force on", "Force off", "Guest" };
+const char *config_dbg_vtotal_msg[] = { "Default", "312 (PAL)", "262 (NTSC)", "287" };
+const char *config_dbg_skew_msg[]   = { "Off", "vpos +1", "vpos -1", "hpos +16" };
 const char *config_chipset_msg[] = { "OCS-A500", "OCS-A1000", "ECS", "---", "---", "---", "AGA", "---" };
 
 typedef struct

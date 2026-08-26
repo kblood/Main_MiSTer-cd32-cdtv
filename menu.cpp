@@ -177,6 +177,8 @@ enum MENU
 	MENU_MINIMIG_MAIN2,
 	MENU_MINIMIG_VIDEO1,
 	MENU_MINIMIG_VIDEO2,
+	MENU_MINIMIG_DEBUG1,
+	MENU_MINIMIG_DEBUG2,
 	MENU_MINIMIG_CHIPSET1,
 	MENU_MINIMIG_CHIPSET2,
 	MENU_MINIMIG_DISK1,
@@ -5835,7 +5837,7 @@ void HandleUI(void)
 		/* minimig main menu                                              */
 		/******************************************************************/
 	case MENU_MINIMIG_MAIN1:
-		menumask = 0x7BC0;
+		menumask = 0xFBC0;
 		OsdSetTitle("Minimig", OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
 		helptext_idx = HELPTEXT_MAIN;
 
@@ -5921,10 +5923,11 @@ void HandleUI(void)
 			MenuWrite(m++);
 			MenuWrite(m++, " Save configuration        \x16", menusub == 11, 0);
 			MenuWrite(m++, " Load configuration        \x16", menusub == 12, 0);
+			MenuWrite(m++, " Debug                     \x16", menusub == 13, 0);
 
-			while (m < 14) MenuWrite(m++);
-			MenuWrite(m++, " Reset", menusub == 13, 0);
-			MenuWrite(m, STD_EXIT, menusub == 14, 0);
+			while (m < 15) MenuWrite(m++);
+			MenuWrite(m++, " Reset", menusub == 14, 0);
+			MenuWrite(m, STD_EXIT, menusub == 15, 0);
 
 			if (!adjvisible) break;
 			firstmenu += adjvisible;
@@ -6055,10 +6058,15 @@ void HandleUI(void)
 				}
 				else if (menusub == 13)
 				{
+					menusub = 0;
+					menustate = MENU_MINIMIG_DEBUG1;
+				}
+				else if (menusub == 14)
+				{
 					menustate = MENU_NONE1;
 					minimig_reset();
 				}
-				else if (menusub == 14)
+				else if (menusub == 15)
 				{
 					menustate = MENU_NONE1;
 				}
@@ -6261,6 +6269,109 @@ void HandleUI(void)
 		{
 			menustate = MENU_MINIMIG_MAIN1;
 			menusub = 11;
+		}
+		break;
+
+	case MENU_MINIMIG_DEBUG1:
+		helptext_idx = HELPTEXT_NONE;
+		menumask = 0x1FF;
+		OsdSetTitle("Debug");
+		parentstate = menustate;
+
+		while (1)
+		{
+			if (!menusub) firstmenu = 0;
+			adjvisible = 0;
+			m = 0;
+
+			{
+			unsigned char dbg = minimig_GetDebug();
+
+			sprintf(s, " Video      : %s", (minimig_config.chipset & CONFIG_NTSC) ? "NTSC 60Hz" : "PAL 50Hz");
+			MenuWrite(m++, s, menusub == 0, 0);
+			sprintf(s, " VTotal     : %s", config_dbg_vtotal_msg[(dbg >> 2) & 3]);
+			MenuWrite(m++, s, menusub == 1, 0);
+			sprintf(s, " Tell guest : %s", (dbg & 0x80) ? "NTSC" : "as above");
+			MenuWrite(m++, s, menusub == 2, 0);
+
+			MenuWrite(m++);
+			sprintf(s, " BLTPRI     : %s", config_dbg_bltpri_msg[dbg & 3]);
+			MenuWrite(m++, s, menusub == 3, 0);
+			sprintf(s, " Beam skew  : %s", config_dbg_skew_msg[(dbg >> 4) & 3]);
+			MenuWrite(m++, s, menusub == 4, 0);
+
+			MenuWrite(m++);
+			sprintf(s, " Dense trace: %s", (dbg & 0x40) ? "On (v250-262)" : "Off");
+			MenuWrite(m++, s, menusub == 5, 0);
+
+			MenuWrite(m++);
+			sprintf(s, " dbg_config : $%02X%s", dbg, dbg ? "" : "  (stock)");
+			MenuWrite(m++, s, menusub == 6, 0);
+			MenuWrite(m++, " Reset all to stock", menusub == 7, 0);
+			}
+
+			while (m < 15) MenuWrite(m++);
+			MenuWrite(m, STD_BACK, menusub == 8, 0);
+
+			if (!adjvisible) break;
+			firstmenu += adjvisible;
+		}
+
+		menustate = MENU_MINIMIG_DEBUG2;
+		break;
+
+	case MENU_MINIMIG_DEBUG2:
+		saved_menustate = MENU_MINIMIG_DEBUG1;
+		if (menu)
+		{
+			menustate = MENU_MINIMIG_MAIN1;
+			menusub = 13;
+		}
+		else if (select || minus || plus)
+		{
+			int step = minus ? 3 : 1;
+			unsigned char dbg = minimig_GetDebug();
+			menustate = MENU_MINIMIG_DEBUG1;
+
+			switch (menusub)
+			{
+			case 0:
+				minimig_config.chipset ^= CONFIG_NTSC;
+				minimig_ConfigChipset(&minimig_config);
+				break;
+
+			case 1:
+				minimig_ConfigDebug((dbg & ~0x0C) | ((((dbg >> 2) + step) & 3) << 2));
+				break;
+
+			case 2:
+				minimig_ConfigDebug(dbg ^ 0x80);
+				break;
+
+			case 3:
+				minimig_ConfigDebug((dbg & ~0x03) | ((dbg + step) & 3));
+				break;
+
+			case 4:
+				minimig_ConfigDebug((dbg & ~0x30) | ((((dbg >> 4) + step) & 3) << 4));
+				break;
+
+			case 5:
+				minimig_ConfigDebug(dbg ^ 0x40);
+				break;
+
+			case 6:
+				break;
+
+			case 7:
+				minimig_ConfigDebug(0);
+				break;
+
+			case 8:
+				menustate = MENU_MINIMIG_MAIN1;
+				menusub = 13;
+				break;
+			}
 		}
 		break;
 
