@@ -99,6 +99,7 @@
 #define UIO_MM2_FLP     0xF7 //0x44
 #define UIO_MM2_HDD     0xF8 //0x54
 #define UIO_MM2_JOY     0xF9 //0x64
+#define UIO_MM2_DBG     0xFA //0x74 debug knobs, experiment cores only
 
 #define JOY_RIGHT       0x01
 #define JOY_LEFT        0x02

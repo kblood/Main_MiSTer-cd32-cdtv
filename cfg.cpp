@@ -41,6 +41,7 @@ static const ini_var_t ini_vars[] =
 	{ "FORCED_SCANDOUBLER", (void*)(&(cfg.forced_scandoubler)), UINT8, 0, 1 },
 	{ "VGA_SCALER", (void*)(&(cfg.vga_scaler)), UINT8, 0, 1 },
 	{ "VGA_SOG", (void*)(&(cfg.vga_sog)), UINT8, 0, 1 },
+	{ "MINIMIG_DEBUG", (void*)(&(cfg.minimig_debug)), UINT8, 0, 255 },
 	{ "KEYRAH_MODE", (void*)(&(cfg.keyrah_mode)), HEX32, 0, 0xFFFFFFFF },
 	{ "RESET_COMBO", (void*)(&(cfg.reset_combo)), UINT8, 0, 3 },
 	{ "KEY_MENU_AS_RGUI", (void*)(&(cfg.key_menu_as_rgui)), UINT8, 0, 1 },

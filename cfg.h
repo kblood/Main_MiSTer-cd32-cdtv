@@ -63,6 +63,7 @@ typedef struct {
 	uint8_t shmask_mode_default;
 	int bt_auto_disconnect;
 	int bt_reset_before_pair;
+	uint8_t minimig_debug;
 	char bootcore[256];
 	char video_conf[1024];
 	char video_conf_pal[1024];

@@ -408,6 +408,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	if (!reloadkickstart)
 	{
 		minimig_ConfigChipset(&minimig_config);
+		minimig_ConfigDebug(cfg.minimig_debug);
 		minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
 	}
 
@@ -455,6 +456,7 @@ static void ApplyConfiguration(char reloadkickstart)
 	minimig_ConfigCPU(minimig_config.cpu);
 
 	minimig_ConfigChipset(&minimig_config);
+	minimig_ConfigDebug(cfg.minimig_debug);
 	minimig_ConfigFloppy(minimig_config.floppy.drives, minimig_config.floppy.speed);
 
 	if (minimig_config.memory & 0x40) UploadActionReplay();
@@ -838,6 +840,11 @@ void minimig_ConfigChipset(mm_configTYPE *config)
 {
 	unsigned char chipset = config->cdtv_drive.cfg ? (config->chipset | CONFIG_CDTV) : (config->chipset & ~CONFIG_CDTV);
 	spi_uio_cmd8(UIO_MM2_CHIP, chipset & 0x3f);
+}
+
+void minimig_ConfigDebug(unsigned char dbg)
+{
+	spi_uio_cmd8(UIO_MM2_DBG, dbg);
 }
 
 void minimig_ConfigFloppy(unsigned char drives, unsigned char speed)
