@@ -3219,6 +3219,7 @@ void user_io_poll()
 		}
 
 		minimig_share_poll();
+		minimig_debug_poll();
 		a2065_poll();
 	}
 

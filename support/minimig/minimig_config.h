@@ -88,6 +88,8 @@ void minimig_ConfigMemory(unsigned char memory);
 void minimig_ConfigCPU(unsigned char cpu);
 void minimig_ConfigChipset(mm_configTYPE *config);
 void minimig_ConfigDebug(unsigned char dbg);
+unsigned char minimig_GetDebug();
+void minimig_debug_poll();
 void minimig_ConfigFloppy(unsigned char drives, unsigned char speed);
 void minimig_ConfigAutofire(unsigned char autofire, unsigned char mask);
 

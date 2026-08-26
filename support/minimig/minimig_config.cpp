@@ -21,6 +21,7 @@
 #include "akiko_cd32.h"
 #include "cdtv_cd.h"
 #include <unistd.h>
+#include <stdlib.h>
 
 const char *config_memory_chip_msg[] = { "512K", "1M",   "1.5M", "2M" };
 const char *config_memory_slow_msg[] = { "none", "512K", "1M",   "1.5M" };
@@ -842,9 +843,43 @@ void minimig_ConfigChipset(mm_configTYPE *config)
 	spi_uio_cmd8(UIO_MM2_CHIP, chipset & 0x3f);
 }
 
+static unsigned char dbg_live = 0;
+
 void minimig_ConfigDebug(unsigned char dbg)
 {
+	dbg_live = dbg;
 	spi_uio_cmd8(UIO_MM2_DBG, dbg);
+}
+
+unsigned char minimig_GetDebug()
+{
+	return dbg_live;
+}
+
+// Runtime override: write a value into /tmp/minimig_dbg and it is pushed to the
+// core within a quarter second, with no restart and no core reload. Accepts
+// decimal, 0x-hex or 0-octal. Deleting the file leaves the last value in place.
+void minimig_debug_poll()
+{
+	static unsigned long timer = 0;
+	if (timer && !CheckTimer(timer)) return;
+	timer = GetTimer(250);
+
+	FILE *f = fopen("/tmp/minimig_dbg", "r");
+	if (!f) return;
+
+	char buf[32];
+	char *line = fgets(buf, sizeof(buf), f);
+	fclose(f);
+	if (!line) return;
+
+	char *end = 0;
+	unsigned long v = strtoul(line, &end, 0);
+	if (end == line || v > 255) return;
+
+	if ((unsigned char)v == dbg_live) return;
+	printf("minimig: dbg_config %02X -> %02X (/tmp/minimig_dbg)\n", dbg_live, (unsigned char)v);
+	minimig_ConfigDebug((unsigned char)v);
 }
 
 void minimig_ConfigFloppy(unsigned char drives, unsigned char speed)
