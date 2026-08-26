@@ -23,8 +23,17 @@ static const char *ARM_MARKER = "/tmp/chipset_trace_on";
 // absorb between drains. It was 200 ms, which is 10 PAL frames -- far longer
 // than the ring can hold at this title's event rate, so most batches ended up
 // dropping. 50 ms is 2.5 PAL frames and gives 4x the drain opportunities at
-// the same SPI cost per event.
-static constexpr unsigned SAMPLE_PERIOD_MS = 50;
+// the same SPI cost per event. 20 ms is one PAL frame.
+static constexpr unsigned SAMPLE_PERIOD_MS = 20;
+
+// Entries to pull in one drain, distinct from the ring's depth. Reading at
+// most RING_DEPTH per poll caps sustained throughput at RING_DEPTH /
+// SAMPLE_PERIOD_MS regardless of how fast SPI actually is -- 1024 per 50 ms
+// was 20,480 events/s, and the row-signature instrument offers about 22,800,
+// so every capture bled a steady 23% into GAP records. The loop already stops
+// on the ring-empty sentinel, so this is only a runaway bound: the drain now
+// keeps reading until the ring is actually empty.
+static constexpr int MAX_DRAIN_PER_POLL = 65536;
 
 static const char *SRC_LABELS[8] = {
     "cpu", "cop", "blt", "spr", "bpl", "dsk", "aud", "ref",
@@ -90,7 +99,7 @@ void chipset_trace_drain(void)
 
     int got = 0;
     int dropped_this_batch = 0;
-    for (int i = 0; i < RING_DEPTH; i++) {
+    for (int i = 0; i < MAX_DRAIN_PER_POLL; i++) {
         uint8_t b[8];
         for (int j = 0; j < 8; j++) b[j] = (uint8_t)spi_w(0);
 
