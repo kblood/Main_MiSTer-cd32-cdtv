@@ -178,6 +178,16 @@ static bool           stch_wait_ack = false;   // armed at CDDA play-end
 #define CDTV_AIR_BYTE_OFF      0x00be          // TPI AIR register (reg 7) trace byte offset
 #define CDTV_AIR_CODE_STCH     0x04            // AIR source code = STCH taken/acked
 
+// Play-START STCH (4964847, upstream 2c410aa8). cdtv.device 35.9 completes a
+// PLAY IORequest from a status CHANGE on watched bit 2 (cd_playing), not from
+// the drive's immediate 0x42 ack: its PORTS server at $F05A10 computes
+// d1 = ($140(a6) ^ status) & $141(a6) and only runs the play-end dispatch at
+// $F05BE0 on a transition of that bit. Raising STCH only at play-end left bit 2
+// already 0, so no transition ever occurred and DotC's _cd_stop (AbortIO +
+// WaitIO) blocked forever on the map of Britain. Set here, drained one poll
+// iteration later so the 0x42 reply is on the wire first.
+static bool           stch_playstart_pending = false;
+
 // -----------------------------------------------------------------------------
 // Helpers — gate on CDTV mode
 // -----------------------------------------------------------------------------
@@ -819,6 +829,7 @@ static int cmd_play(const uint8_t *cmd, uint8_t *out)
 
 	cd_playing = 1;
 	cd_motor   = 1;
+	stch_playstart_pending = true;
 	out[0] = 0x42;        // playing + media (WinUAE cdtv.cpp play_cd return)
 	return 1;
 }
@@ -1168,6 +1179,18 @@ void cdtv_cd_init(void)
 void cdtv_cd_poll(void)
 {
 	if (!cdtv_active()) return;
+
+	// Play-START STCH, drained exactly one poll iteration after cmd_play() armed
+	// it. cmd_play() runs from cdtv_dispatch() inside the command-drain loop at
+	// the BOTTOM of this function, and cdtv_push_reply() puts the 0x42 on the wire
+	// synchronously there, so by the time control reaches here on the NEXT poll
+	// the ROM has already taken the ack. Ordering is load-bearing: the ROM needs
+	// the 0x42 first, then the 0 -> 1 on status bit 2.
+	if (stch_playstart_pending) {
+		stch_playstart_pending = false;
+		cdtv_dbg("STCH play-start (playing=%d motor=%d)", cd_playing, cd_motor);
+		cdtv_inject_stch();
+	}
 
 	// Retry STCH inject on a slow cadence until BIOS progresses past STATUS
 	// polling. See stch_retries comment for why a single pulse isn't enough.
